@@ -4,6 +4,10 @@ A personal coding-agent orchestrator written in Go. One daemon runs GitHub issue
 
 Agents implement and commit changes. Changathi validates those commits, publishes PRs, and merges when checks and repository rules permit. The GitHub issue stays open with `agent:review` until you review and close it.
 
+![Changathi terminal dashboard showing a supervisor, child issue statuses, and agent output](docs/images/changathi-dashboard.png)
+
+The dashboard keeps the supervisor and child issues beside the selected agent's output, with keyboard navigation and mouse-wheel scrolling.
+
 ## Build and setup
 
 Requires Go 1.26+, Git, GitHub CLI, and Codex CLI. The Codex protocol handshake was verified with `codex-cli 0.160.0`.
