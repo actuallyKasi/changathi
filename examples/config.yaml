@@ -1,0 +1,7 @@
+# Replace this path with your own absolute state directory.
+data_dir: /Users/you/.local/share/changathi
+concurrency: 2
+poll_seconds: 30
+codex: codex
+max_log_bytes: 16777216
+event_limit: 10000

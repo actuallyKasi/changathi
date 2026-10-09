@@ -1,0 +1,22 @@
+/bin/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+
+# Local configuration, credentials, and runtime output
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+auth.json
+*.log
+*.log.*
+*.sock
+/logs/
+/state/
+/.changathi/
