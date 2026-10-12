@@ -433,3 +433,17 @@ func TestReworkGenerationCarriesPrevious(t *testing.T) {
 		t.Fatalf("rework %+v %v", rework.Previous, err)
 	}
 }
+
+// A Claude verifier is told its read-only tool surface, so it does not spend
+// calls on commands that dontAsk mode denies.
+func TestVerifierPromptNamesClaudeTools(t *testing.T) {
+	a := core.Attempt{Issue: core.Issue{Number: 2, Title: "t"}}
+	p := core.Project{Repo: "o/r"}
+	claude := verifierPrompt(p, a, core.Role{Provider: "claude", Model: "claude-sonnet-5-5"}, "diff")
+	if !strings.Contains(claude, "`git diff`, `git log`") || !strings.Contains(claude, "`git ls-files`") || !strings.Contains(claude, "do not build, test or run the program") {
+		t.Fatalf("claude verifier prompt:\n%s", claude)
+	}
+	if codex := verifierPrompt(p, a, core.Role{Provider: "codex"}, "diff"); strings.Contains(codex, "`git ls-files`") {
+		t.Fatal("codex verifier told about Claude's allow-list")
+	}
+}

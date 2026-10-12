@@ -4,6 +4,7 @@ import (
 	"changathi/internal/core"
 	"changathi/internal/provider"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,6 +87,13 @@ func (g *fakeGH) Prepare(context.Context, core.Project) ([]string, error) {
 type fakeProvider struct {
 	block   <-chan struct{}
 	entered chan string
+	// reply is the agent's final message; noCommit leaves the branch untouched.
+	reply    string
+	noCommit bool
+	// limits are returned, in order, by the first turns before any work.
+	limits  []error
+	mu      sync.Mutex
+	prompts []string
 }
 type fakeSession struct {
 	workspace string
@@ -99,7 +107,17 @@ func (s *fakeSession) Start(_ context.Context, r provider.Request) error {
 	s.workspace = r.Workspace
 	return nil
 }
-func (s *fakeSession) Run(ctx context.Context, _ string, emit func(provider.Event)) error {
+func (s *fakeSession) Run(ctx context.Context, prompt string, emit func(provider.Event)) error {
+	s.p.mu.Lock()
+	s.p.prompts = append(s.p.prompts, prompt)
+	var limit error
+	if len(s.p.limits) > 0 {
+		limit, s.p.limits = s.p.limits[0], s.p.limits[1:]
+	}
+	s.p.mu.Unlock()
+	if limit != nil {
+		return limit
+	}
 	emit(provider.Event{Type: "session_started", Thread: "fake-thread", Turn: "fake-turn"})
 	if s.p.entered != nil {
 		s.p.entered <- s.workspace
@@ -110,6 +128,12 @@ func (s *fakeSession) Run(ctx context.Context, _ string, emit func(provider.Even
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if s.p.reply != "" {
+		emit(provider.Event{Type: "item/completed", Turn: "fake-turn", Output: &core.Output{Kind: "assistant", ItemID: "msg", Mode: "snapshot", Status: "completed", Text: s.p.reply}})
+	}
+	if s.p.noCommit {
+		return nil
 	}
 	if e := os.WriteFile(filepath.Join(s.workspace, "feature.txt"), []byte("feature\n"), 0600); e != nil {
 		return e
@@ -363,5 +387,95 @@ func TestProviderLimitPausesAllDispatch(t *testing.T) {
 	a, _ = e.current(a.ID)
 	if a.State != "waiting_account" || a.Due.IsZero() {
 		t.Fatal("work not preserved in account wait")
+	}
+}
+
+// expireGates lifts every provider gate, as if the limit had reset.
+func expireGates(t *testing.T, e *Engine) {
+	t.Helper()
+	for _, key := range []string{core.GateKey("codex", ""), core.GateKey("claude", "")} {
+		if err := e.Store.Put("gate", key, core.ProviderGate{Until: core.Now().Add(-time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAccountLimitGatesUntilReset(t *testing.T) {
+	resets := core.Now().Add(3 * time.Hour).Truncate(time.Second)
+	limits := []error{}
+	for range 6 {
+		limits = append(limits, &provider.LimitError{Err: errors.New("Claude usage limit (seven_day): You've hit your weekly limit"), Resets: resets})
+	}
+	e, gh, ps := setup(t, 1, &fakeProvider{limits: limits})
+	ctx := context.Background()
+	a, _ := e.Store.Enqueue(ps[0], gh.issues[ps[0].ID], "manual", false)
+	// More limited probes than max_turns (5) must not exhaust the attempt.
+	for i := range 6 {
+		a, _ = e.current(a.ID)
+		e.execute(ctx, ps[0], a)
+		a, _ = e.current(a.ID)
+		if a.State != "waiting_account" || a.Turns != 0 {
+			t.Fatalf("probe %d: state=%s turns=%d error=%s", i, a.State, a.Turns, a.Error)
+		}
+		if want := resets.Add(limitMargin); !a.Due.Equal(want) {
+			t.Fatalf("probe %d: due %v, want %v", i, a.Due, want)
+		}
+		if g := e.gate(core.Role{Provider: "codex"}); g == nil || !g.Until.Equal(a.Due) {
+			t.Fatalf("probe %d: gate %+v", i, g)
+		}
+		expireGates(t, e)
+	}
+	e.execute(ctx, ps[0], a)
+	a, _ = e.current(a.ID)
+	if a.State != "awaiting_review" || a.Turns != 1 {
+		t.Fatalf("after limit: state=%s turns=%d error=%s", a.State, a.Turns, a.Error)
+	}
+}
+
+func TestAccountLimitReadsResetFromMessage(t *testing.T) {
+	mel, err := time.LoadLocation("Australia/Melbourne")
+	if err != nil {
+		t.Skip("no zoneinfo")
+	}
+	at := core.Now().Add(3 * time.Hour).In(mel)
+	msg := fmt.Sprintf("Claude usage limit (five_hour): You've hit your session limit · resets %s (Australia/Melbourne)", at.Format("3pm"))
+	e, gh, ps := setup(t, 1, &fakeProvider{limits: []error{errors.New(msg)}})
+	a, _ := e.Store.Enqueue(ps[0], gh.issues[ps[0].ID], "manual", false)
+	e.execute(context.Background(), ps[0], a)
+	a, _ = e.current(a.ID)
+	want := time.Date(at.Year(), at.Month(), at.Day(), at.Hour(), 0, 0, 0, mel).Add(limitMargin)
+	if a.State != "waiting_account" || a.Turns != 0 || !a.Due.Equal(want) {
+		t.Fatalf("state=%s turns=%d due=%v want %v", a.State, a.Turns, a.Due, want)
+	}
+}
+
+func TestParseReset(t *testing.T) {
+	mel, err := time.LoadLocation("Australia/Melbourne")
+	if err != nil {
+		t.Skip("no zoneinfo")
+	}
+	now := time.Date(2026, 10, 12, 17, 58, 0, 0, mel)
+	for _, c := range []struct {
+		msg  string
+		want time.Time
+	}{
+		{"You've hit your session limit · resets 6pm (Australia/Melbourne)", time.Date(2026, 10, 12, 18, 0, 0, 0, mel)},
+		{"session limit · resets 5:30pm (Australia/Melbourne)", time.Date(2026, 10, 13, 17, 30, 0, 0, mel)},
+		{"weekly limit · resets Oct 15, 9am (Australia/Melbourne)", time.Date(2026, 10, 15, 9, 0, 0, 0, mel)},
+		{"Your limit will reset at 12am (UTC)", time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC)},
+		{"limit · resets Oct 19 at 1am (Australia/Melbourne)", time.Date(2026, 10, 19, 1, 0, 0, 0, mel)},
+	} {
+		got, ok := parseReset(c.msg, now.UTC())
+		if !ok || !got.Equal(c.want) {
+			t.Errorf("%q: got %v %v, want %v", c.msg, got, ok, c.want)
+		}
+	}
+	for _, msg := range []string{"usage limit reached", "resets 13pm", "resets 6:75pm"} {
+		if got, ok := parseReset(msg, now.UTC()); ok {
+			t.Errorf("%q parsed as %v", msg, got)
+		}
+	}
+	if got := limitUntil(errors.New("usage limit reached"), now); !got.Equal(now.Add(limitBackoff)) {
+		t.Errorf("fallback %v", got)
 	}
 }

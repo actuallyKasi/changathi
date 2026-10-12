@@ -21,6 +21,11 @@ changathi summary           # fails with "cannot reach daemon" if it isn't runni
 
 If the daemon isn't running, offer `changathi daemon install`: it sets the daemon up as a launchd (macOS) or systemd (Linux) service, starts it and waits until it answers, and is safe to re-run. Ask before installing the service. Don't run `changathi daemon start` yourself in a shell that will exit.
 
+Check which providers the running daemon actually has before you onboard or dispatch anything:
+
+- The service's command line shows its config (`ps -o command= -p $(pgrep -f 'changathi daemon start')`). With no `--config`, or a config without a `providers` block, the daemon is Codex only, whatever `WORKFLOW.md` says.
+- A daemon started before the binary was rebuilt keeps running the old code. If the daemon is older than the binary, or the source checkout has newer commits than the binary, rebuild and re-run `daemon install` with the same `--config`, then `changathi skill install`. Ask first, because this restarts running work.
+
 ## Onboard a repository
 
 1. Read the repository and work out the commands that prove a change is good: build, tests, lint, vet. They must run unattended and fail loudly.
@@ -49,7 +54,7 @@ If the daemon isn't running, offer `changathi daemon install`: it sets the daemo
      verify: {provider: claude, model: claude-sonnet-5-5, effort: medium}
    ```
 
-   The verifier reviews each validated head read-only. Its blocking findings go back to the implementer, and its notes are posted on the PR as a review comment. Every role's provider and model must be on the daemon's `providers` allow-list (see `examples/config.yaml`); otherwise the project shows a workflow error and nothing dispatches. Ask the user before choosing models, since they decide the cost.
+   The verifier reviews each validated head read-only. Its blocking findings go back to the implementer, and its notes are posted on the PR as a review comment. Every role's provider and model must be on the daemon's `providers` allow-list (see `examples/config.yaml`); otherwise the project shows a workflow error and nothing dispatches. Ask the user before choosing models, since they decide the cost. Settle the provider before any issue is dispatched, because each attempt keeps the `WORKFLOW.md` it was first dispatched with. A later change to the base branch reaches an existing attempt only through `issue retry`, which re-reads it.
 
    The body is a Go `text/template` that receives `.Issue`. Keep it short, because Changathi already adds the issue text and delivery rules to the prompt.
 3. Register the repository:
@@ -116,7 +121,7 @@ changathi agent list --active                  # compact rows with the latest ve
 changathi agent show <id>                      # one agent: roles, latest verdict; no workflow or issue body (--full for all)
 changathi agent logs <id> --last               # the agent's last message and what followed
 changathi agent logs <id> --tail 20            # last 20 transcript items; --full adds tool output
-changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub
+changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub; re-reads WORKFLOW.md
 changathi issue cancel '<project>#<number>'    # stop the active attempt for an issue
 changathi project pause|resume <name>
 changathi usage                                # Codex account limits; Claude tokens and cost per model, last rate-limit window
@@ -127,6 +132,7 @@ When an agent shows `needs_attention`, read `agent logs <id> --last` and say why
 There is no way to message a running agent. The user reviews and asks for rework on GitHub:
 
 - **Rework of the same issue** (it stopped, or it merged but misses the acceptance criteria): they comment on the issue with what to change, then add the `agent:rework` label. Changathi removes the label, re-queues the issue (a new generation with a new PR if the old one merged) and passes their comments to the agent. Only comments by the `gh` login Changathi runs as reach the agent. If they ask you to do this, draft the comment for them to post or approve; don't post it as them unasked.
+- **A question, not a change request** ("do we need to handle X?"): this doesn't need `agent:rework`. Answer it yourself from the code, the issue, the PR and `agent logs <id>`. Use rework only when the user wants code changed. If a question does go through `agent:rework`, the agent is told to answer without changing code. Changathi then posts its answer on the issue as an "agent reply" comment and the attempt goes back to `awaiting_review` (the earlier merged PR stays the delivery), with no validation, verification or new PR. If there was no merged generation before it, the attempt goes to `needs_attention` instead. The reply is also in `agent logs <id>` as a `reply` event. If the turn changes the branch anyway, the reply is ignored and the change is validated and delivered as usual.
 - **A separate bug or follow-up idea**: a new issue that links back. The original is closed as completed once its own criteria are met.
 - **Supervisor children**: rework before the child is closed, so its dependants wait for the new delivery. Never close and reopen a child to trigger rework.
 

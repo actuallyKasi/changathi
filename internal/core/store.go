@@ -212,6 +212,10 @@ func (s *Store) enqueueLocked(p Project, i Issue, trigger string, retry bool, su
 			latest.Turns = 0
 			latest.VerifyFailures = 0
 			latest.NextStep = ""
+			// Re-read WORKFLOW.md from the base branch so an operator retry picks
+			// up policy changes such as a new provider; ThreadProvider keeps an
+			// old provider's thread from being resumed by the new one.
+			latest.Workflow = Workflow{}
 			latest.PID = 0
 			latest.ReadyRemoved = false
 			latest.Due = time.Time{}

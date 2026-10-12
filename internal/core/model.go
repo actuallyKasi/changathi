@@ -154,6 +154,9 @@ type Attempt struct {
 	// later rework only passes newer comments.
 	Feedback   string    `json:"feedback,omitempty"`
 	FeedbackAt time.Time `json:"feedback_at,omitempty"`
+	// Reply is the agent's answer to the operator's comments when a rework turn
+	// ended with no code change; Changathi posts it on the issue.
+	Reply string `json:"reply,omitempty"`
 	// StatusPosted is a digest of the status comment last published on the issue.
 	StatusPosted string `json:"status_posted,omitempty"`
 	// Previous summarizes the generation this one reworks.

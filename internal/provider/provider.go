@@ -3,6 +3,7 @@ package provider
 import (
 	"changathi/internal/core"
 	"context"
+	"time"
 )
 
 type Event struct {
@@ -32,3 +33,13 @@ type Session interface {
 type Provider interface {
 	Open(context.Context) (Session, error)
 }
+
+// LimitError reports an account usage limit. Resets is when the provider says
+// the limit lifts, or zero when it did not say.
+type LimitError struct {
+	Err    error
+	Resets time.Time
+}
+
+func (e *LimitError) Error() string { return e.Err.Error() }
+func (e *LimitError) Unwrap() error { return e.Err }
