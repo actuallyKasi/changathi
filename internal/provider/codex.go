@@ -36,7 +36,6 @@ type codexSession struct {
 	done    chan struct{}
 	seq     atomic.Int64
 	thread  string
-	turn    string
 	closed  atomic.Bool
 	err     error
 }
@@ -157,6 +156,9 @@ func (s *codexSession) call(ctx context.Context, method string, params any) (jso
 }
 func (s *codexSession) Start(ctx context.Context, r Request) error {
 	params := map[string]any{"cwd": r.Workspace, "approvalPolicy": "never", "sandbox": "danger-full-access"}
+	if r.ReadOnly {
+		params["sandbox"] = "read-only"
+	}
 	if r.Model != "" {
 		params["model"] = r.Model
 	}
@@ -199,9 +201,6 @@ func (s *codexSession) Run(ctx context.Context, prompt string, emit func(Event))
 	if e = json.Unmarshal(b, &start); e != nil {
 		return e
 	}
-	s.mu.Lock()
-	s.turn = start.Turn.ID
-	s.mu.Unlock()
 	emit(Event{Type: "session_started", Thread: s.thread, Turn: start.Turn.ID, PID: s.cmd.Process.Pid})
 	for {
 		select {
@@ -251,16 +250,6 @@ func (s *codexSession) Run(ctx context.Context, prompt string, emit func(Event))
 			}
 		}
 	}
-}
-func (s *codexSession) Steer(ctx context.Context, text, id string) error {
-	s.mu.Lock()
-	turn := s.turn
-	s.mu.Unlock()
-	if turn == "" {
-		return errors.New("no active turn")
-	}
-	_, e := s.call(ctx, "turn/steer", map[string]any{"threadId": s.thread, "expectedTurnId": turn, "input": input(text), "clientUserMessageId": id})
-	return e
 }
 func (s *codexSession) Close() error {
 	if s.closed.Swap(true) {

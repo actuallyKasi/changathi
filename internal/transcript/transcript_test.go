@@ -72,13 +72,6 @@ func TestToolSnapshotAndMessageDelivery(t *testing.T) {
 	if tr.Items[0].Text != "FAIL: expected x\n" || tr.Items[0].Status != "failed" {
 		t.Fatal(tr.Items)
 	}
-	m := core.Message{ID: "m", AttemptID: "attempt", Text: "Please retry", State: "queued", Created: time.Unix(2, 0)}
-	tr.Messages([]core.Message{m}, "attempt")
-	m.State = "acknowledged"
-	tr.Messages([]core.Message{m}, "attempt")
-	if len(tr.Items) != 2 || tr.Items[1].Status != "acknowledged" {
-		t.Fatal(tr.Items)
-	}
 }
 
 func BenchmarkLargeTranscriptRender(b *testing.B) {

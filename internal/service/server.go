@@ -28,7 +28,6 @@ type Request struct {
 	Project       string `json:"project,omitempty"`
 	Attempt       string `json:"attempt,omitempty"`
 	Number        int    `json:"number,omitempty"`
-	Text          string `json:"text,omitempty"`
 	Repo          string `json:"repo,omitempty"`
 	Auto          bool   `json:"auto,omitempty"`
 	Concurrency   int    `json:"concurrency,omitempty"`
@@ -81,7 +80,7 @@ func Serve(ctx context.Context, c core.Config) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	engine := New(c, s, core.GH{}, provider.Codex{Command: c.Codex})
+	engine := New(c, s, core.GH{}, map[string]provider.Provider{"codex": provider.Codex{Command: c.Codex}, "claude": provider.Claude{Command: c.Claude}})
 	server := &Server{Engine: engine, cancel: cancel}
 	httpServer := &http.Server{Handler: server, ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
@@ -189,17 +188,36 @@ func (s *Server) perform(ctx context.Context, r Request) (any, error) {
 	e := s.Engine
 	switch r.Action {
 	case "usage":
-		p, ok := e.Provider.(interface {
-			Usage(context.Context) (any, error)
-		})
-		if !ok {
-			return nil, errors.New("provider does not expose usage metadata")
+		// Providers with an account API report live limits; Claude reports locally
+		// aggregated per-model usage and the last rate-limit window it observed.
+		out := map[string]any{}
+		var errs []string
+		for _, name := range core.Providers {
+			p, ok := e.Providers[name].(interface {
+				Usage(context.Context) (any, error)
+			})
+			if ok && (name != "codex" || e.Config.Allows(core.Role{Provider: "codex"}) == nil) {
+				value, err := p.Usage(ctx)
+				if err != nil {
+					errs = append(errs, name+": "+err.Error())
+					continue
+				}
+				_ = e.Store.Put("usage", name, value)
+				out[name] = value
+				continue
+			}
+			var value any
+			if e.Store.Get("usage", name, &value) == nil && value != nil {
+				out[name] = value
+			}
 		}
-		value, err := p.Usage(ctx)
-		if err == nil {
-			err = e.Store.Put("usage", "codex", value)
+		if len(out) == 0 && len(errs) > 0 {
+			return nil, errors.New(strings.Join(errs, "; "))
 		}
-		return value, err
+		if len(errs) > 0 {
+			out["errors"] = errs
+		}
+		return out, nil
 	case "daemon.stop":
 		s.cancel()
 		return "stopping", nil
@@ -236,8 +254,6 @@ func (s *Server) perform(ctx context.Context, r Request) (any, error) {
 		err = e.Store.UpdateProject(p.ID, func(x *core.Project) error { x.Enabled = r.Action == "project.resume"; p = *x; return nil })
 		e.Wake()
 		return p, err
-	case "agent.message":
-		return e.Message(ctx, r.Attempt, r.Text)
 	case "agent.stop":
 		return "cancelled", e.Cancel(r.Attempt)
 	case "workspace.clean":
@@ -291,7 +307,12 @@ func (s *Server) perform(ctx context.Context, r Request) (any, error) {
 			}
 			e.mu.Unlock()
 		}
-		a, err := e.enqueueIssue(ctx, p, i, r.Action == "issue.retry")
+		var a core.Attempt
+		if r.Action == "issue.retry" {
+			a, err = e.rework(ctx, p, i, "manual")
+		} else {
+			a, err = e.enqueueIssue(ctx, p, i, false, "manual")
+		}
 		e.Wake()
 		return a, err
 	case "issue.cancel":

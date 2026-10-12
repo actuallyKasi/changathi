@@ -13,11 +13,12 @@ import (
 )
 
 type fakeGH struct {
-	mu      sync.Mutex
-	issues  map[string]core.Issue
-	prs     map[string]core.PR
-	creates int
-	merges  int
+	mu       sync.Mutex
+	issues   map[string]core.Issue
+	prs      map[string]core.PR
+	creates  int
+	merges   int
+	comments []string
 }
 
 func (g *fakeGH) Repository(context.Context, string) (core.Project, error) {
@@ -51,6 +52,12 @@ func (g *fakeGH) CreatePR(_ context.Context, p core.Project, a core.Attempt) (*c
 	pr := core.PR{Number: g.creates, State: "OPEN", Head: a.Head, Branch: a.Branch, Base: p.Base, BaseSHA: a.BaseSHA, MergeState: "CLEAN", Mergeable: "MERGEABLE"}
 	g.prs[a.Branch] = pr
 	return &pr, nil
+}
+func (g *fakeGH) ReviewComment(_ context.Context, _ core.Project, number int, body string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.comments = append(g.comments, body)
+	return nil
 }
 func (g *fakeGH) Merge(_ context.Context, p core.Project, pr *core.PR, _ string) error {
 	g.mu.Lock()
@@ -114,9 +121,8 @@ func (s *fakeSession) Run(ctx context.Context, _ string, emit func(provider.Even
 	}
 	return nil
 }
-func (s *fakeSession) Steer(context.Context, string, string) error { return nil }
-func (s *fakeSession) Close() error                                { return nil }
-func setup(t *testing.T, n int, provider *fakeProvider) (*Engine, *fakeGH, []core.Project) {
+func (s *fakeSession) Close() error { return nil }
+func setup(t *testing.T, n int, prov *fakeProvider) (*Engine, *fakeGH, []core.Project) {
 	t.Helper()
 	dir := t.TempDir()
 	store, err := core.OpenStore(dir)
@@ -128,7 +134,7 @@ func setup(t *testing.T, n int, provider *fakeProvider) (*Engine, *fakeGH, []cor
 	cfg := core.DefaultConfig()
 	cfg.DataDir = dir
 	cfg.PollSeconds = 1
-	e := New(cfg, store, gh, provider)
+	e := New(cfg, store, gh, map[string]provider.Provider{"codex": prov})
 	ps := []core.Project{}
 	ctx := context.Background()
 	for j := 0; j < n; j++ {
@@ -209,7 +215,7 @@ func TestEndToEndTwoRepositories(t *testing.T) {
 		t.Fatal("human closure did not finish issue")
 	}
 }
-func TestSchedulerCancellationAndMessaging(t *testing.T) {
+func TestSchedulerCancellation(t *testing.T) {
 	blocked := make(chan struct{})
 	entered := make(chan string, 5)
 	e, _, ps := setup(t, 2, &fakeProvider{block: blocked, entered: entered})
@@ -234,11 +240,7 @@ func TestSchedulerCancellationAndMessaging(t *testing.T) {
 		id = k
 	}
 	e.mu.Unlock()
-	m, err := e.Message(ctx, id, "Please cover edge cases")
-	if err != nil || m.State != "acknowledged" {
-		t.Fatalf("message %s %v", m.State, err)
-	}
-	if err = e.Cancel(id); err != nil {
+	if err := e.Cancel(id); err != nil {
 		t.Fatal(err)
 	}
 	e.wg.Wait()

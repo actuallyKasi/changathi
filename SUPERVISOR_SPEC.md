@@ -100,7 +100,7 @@ Each reconciliation pass:
 6. Atomically claim/enqueue each with trigger `supervisor`, plan ID/revision, child issue ID, and execution generation. The existing scheduler applies project/global capacity and fairness.
 7. Publish progress only when the persisted state changes.
 
-The supervisor does not add `agent:ready` to children. Owned children must be excluded from ordinary label-based auto pickup. Manual `issue run/retry` for an enrolled child routes through the same dependency gate and ownership checks; it cannot bypass prerequisites. Reject execution while the parent is paused/cancelled, with instructions for operator reconciliation.
+The supervisor does not add `agent:ready` to children. Owned children must be excluded from ordinary label-based auto pickup. Manual `issue run/retry` and the `agent:rework` label for an enrolled child route through the same dependency gate and ownership checks; they cannot bypass prerequisites. Rework of a delivered (`awaiting_review`) child starts a new generation; its dependants keep waiting, because completion requires closure after the latest generation's merged delivery. Review a child before closing it: closing and then reopening a prerequisite puts the plan into `needs_attention`. Reject execution while the parent is paused/cancelled, with instructions for operator reconciliation.
 
 One child may belong to only one enrolled non-archived plan. Ownership and attempt creation must be transactional, with a uniqueness invariant on repository ID plus child issue ID. Repeated polls, duplicate API requests, or concurrent manual/automatic triggers must produce one generation, not competing workers.
 
@@ -116,7 +116,7 @@ Every waiting/attention state stores a reason and wake condition. After all chil
 
 `cancel` stops scheduling and owned active execution, preserving results. Resuming a cancelled plan requires an explicit retry/reconciliation action. Project pause has equivalent execution restrictions. Removing the parent label pauses it and prevents subsequent delivery. Pausing/cancelling a parent never closes child issues or discards their work.
 
-A child failure exhausts existing bounded retries before marking that child as needing attention; the plan reports `needs_attention` but is not held, so independent branches keep running and only the failed child's descendants wait. `issue retry` re-queues the failed child. Never skip, close, or relabel a failed prerequisite as completed to continue.
+A child failure exhausts existing bounded retries before marking that child as needing attention; the plan reports `needs_attention` but is not held, so independent branches keep running and only the failed child's descendants wait. `issue retry` or the `agent:rework` label re-queues the failed child. Never skip, close, or relabel a failed prerequisite as completed to continue.
 
 ## 8. Persistence and restart recovery
 

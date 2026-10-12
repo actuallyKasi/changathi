@@ -27,18 +27,55 @@ type Config struct {
 	Concurrency int    `json:"concurrency" yaml:"concurrency"`
 	PollSeconds int    `json:"poll_seconds" yaml:"poll_seconds"`
 	Codex       string `json:"codex" yaml:"codex"`
+	Claude      string `json:"claude" yaml:"claude"`
 	MaxLogBytes int64  `json:"max_log_bytes" yaml:"max_log_bytes"`
 	EventLimit  int    `json:"event_limit" yaml:"event_limit"`
+	// Providers is the host allow-list; repository workflows cannot widen it.
+	// Nil keeps the original behavior: Codex only, any model.
+	Providers map[string]ProviderPolicy `json:"providers,omitempty" yaml:"providers"`
+}
+
+// ProviderPolicy limits the models a provider may run. Empty Models permits any model.
+type ProviderPolicy struct {
+	Models []string `json:"models" yaml:"models"`
 }
 
 func DefaultConfig() Config {
 	h, _ := os.UserHomeDir()
-	return Config{DataDir: filepath.Join(h, ".local", "share", "changathi"), Concurrency: 1, PollSeconds: 30, Codex: "codex", MaxLogBytes: 16 * 1024 * 1024, EventLimit: 10000}
+	return Config{DataDir: filepath.Join(h, ".local", "share", "changathi"), Concurrency: 1, PollSeconds: 30, Codex: "codex", Claude: "claude", MaxLogBytes: 16 * 1024 * 1024, EventLimit: 10000}
+}
+
+// Allows reports whether the host permits a workflow role's provider and model.
+func (c Config) Allows(r Role) error {
+	if c.Providers == nil {
+		if r.Provider != "codex" {
+			return fmt.Errorf("provider %s is not enabled in the service configuration", r.Provider)
+		}
+		return nil
+	}
+	policy, ok := c.Providers[r.Provider]
+	if !ok {
+		return fmt.Errorf("provider %s is not enabled in the service configuration", r.Provider)
+	}
+	if len(policy.Models) == 0 {
+		return nil
+	}
+	for _, m := range policy.Models {
+		if m == r.Model {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q is not allowed for provider %s", r.Model, r.Provider)
 }
 func (c Config) Socket() string { return filepath.Join(c.DataDir, "daemon.sock") }
 func (c Config) Validate() error {
-	if c.Concurrency < 1 || c.PollSeconds < 1 || c.Codex == "" {
-		return fmt.Errorf("concurrency, poll_seconds and codex must be valid")
+	if c.Concurrency < 1 || c.PollSeconds < 1 || c.Codex == "" || c.Claude == "" {
+		return fmt.Errorf("concurrency, poll_seconds, codex and claude must be valid")
+	}
+	for name := range c.Providers {
+		if !KnownProvider(name) {
+			return fmt.Errorf("unknown provider %q in providers", name)
+		}
 	}
 	if !filepath.IsAbs(c.DataDir) {
 		return fmt.Errorf("data directory must be absolute")
@@ -88,31 +125,52 @@ func (i Issue) Ready() bool {
 }
 
 type Attempt struct {
-	SupervisorID string    `json:"supervisor_id,omitempty"`
-	PlanRevision string    `json:"plan_revision,omitempty"`
-	ID           string    `json:"id"`
-	ProjectID    string    `json:"project_id"`
-	Issue        Issue     `json:"issue"`
-	Generation   int       `json:"generation"`
-	Trigger      string    `json:"trigger"`
-	State        string    `json:"state"`
-	Error        string    `json:"error,omitempty"`
-	Branch       string    `json:"branch"`
-	Workspace    string    `json:"workspace,omitempty"`
-	Thread       string    `json:"thread,omitempty"`
-	Turn         string    `json:"turn,omitempty"`
-	PR           int       `json:"pr,omitempty"`
-	Head         string    `json:"head,omitempty"`
-	BaseSHA      string    `json:"base_sha,omitempty"`
-	Workflow     Workflow  `json:"workflow"`
-	Retries      int       `json:"retries"`
-	Turns        int       `json:"turns"`
-	Due          time.Time `json:"due,omitempty"`
-	Created      time.Time `json:"created"`
-	Updated      time.Time `json:"updated"`
-	PID          int       `json:"pid,omitempty"`
-	ReadyRemoved bool      `json:"ready_removed,omitempty"`
-	Activity     string    `json:"activity,omitempty"`
+	SupervisorID string `json:"supervisor_id,omitempty"`
+	PlanRevision string `json:"plan_revision,omitempty"`
+	ID           string `json:"id"`
+	ProjectID    string `json:"project_id"`
+	Issue        Issue  `json:"issue"`
+	Generation   int    `json:"generation"`
+	Trigger      string `json:"trigger"`
+	State        string `json:"state"`
+	Error        string `json:"error,omitempty"`
+	Branch       string `json:"branch"`
+	Workspace    string `json:"workspace,omitempty"`
+	Thread       string `json:"thread,omitempty"`
+	// ThreadProvider names the provider that owns Thread; a thread is never resumed by another provider.
+	ThreadProvider string         `json:"thread_provider,omitempty"`
+	Verifications  []Verification `json:"verifications,omitempty"`
+	// VerifyFailures counts failing verdicts since the last explicit retry.
+	VerifyFailures int `json:"verify_failures,omitempty"`
+	// LastFailure is the latest failure the agent can act on (validation output,
+	// blocking findings, a failing check). Operational waits never overwrite it,
+	// unlike Error, which is the operator-facing reason for the current state.
+	LastFailure string `json:"last_failure,omitempty"`
+	// NextStep is "validate" once an implement turn has completed, so re-entry
+	// after an interruption or a verifier wait resumes without another turn.
+	NextStep string `json:"next_step,omitempty"`
+	// Feedback holds the operator's issue comments captured when rework was
+	// requested; FeedbackAt is the newest comment time already captured, so a
+	// later rework only passes newer comments.
+	Feedback   string    `json:"feedback,omitempty"`
+	FeedbackAt time.Time `json:"feedback_at,omitempty"`
+	// StatusPosted is a digest of the status comment last published on the issue.
+	StatusPosted string `json:"status_posted,omitempty"`
+	// Previous summarizes the generation this one reworks.
+	Previous     *PreviousGeneration `json:"previous,omitempty"`
+	Turn         string              `json:"turn,omitempty"`
+	PR           int                 `json:"pr,omitempty"`
+	Head         string              `json:"head,omitempty"`
+	BaseSHA      string              `json:"base_sha,omitempty"`
+	Workflow     Workflow            `json:"workflow"`
+	Retries      int                 `json:"retries"`
+	Turns        int                 `json:"turns"`
+	Due          time.Time           `json:"due,omitempty"`
+	Created      time.Time           `json:"created"`
+	Updated      time.Time           `json:"updated"`
+	PID          int                 `json:"pid,omitempty"`
+	ReadyRemoved bool                `json:"ready_removed,omitempty"`
+	Activity     string              `json:"activity,omitempty"`
 }
 
 func (a Attempt) Active() bool {
@@ -130,14 +188,6 @@ func (a Attempt) Runnable() bool {
 	return false
 }
 
-type Message struct {
-	ID        string    `json:"id"`
-	AttemptID string    `json:"attempt_id"`
-	Text      string    `json:"text"`
-	State     string    `json:"state"`
-	Created   time.Time `json:"created"`
-	Error     string    `json:"error,omitempty"`
-}
 type Event struct {
 	Version   int       `json:"version,omitempty"`
 	ProjectID string    `json:"project_id,omitempty"`
@@ -170,16 +220,27 @@ type Operation struct {
 	Result    string `json:"result,omitempty"`
 }
 type Snapshot struct {
-	Supervisors  []Supervisor  `json:"supervisors"`
-	Projects     []Project     `json:"projects"`
-	Agents       []Attempt     `json:"agents"`
-	Messages     []Message     `json:"messages"`
-	Events       []Event       `json:"events,omitempty"`
-	Usage        any           `json:"usage,omitempty"`
-	ProviderWait *ProviderGate `json:"provider_wait,omitempty"`
+	Supervisors  []Supervisor   `json:"supervisors"`
+	Projects     []Project      `json:"projects"`
+	Agents       []Attempt      `json:"agents"`
+	Events       []Event        `json:"events,omitempty"`
+	Usage        map[string]any `json:"usage,omitempty"`
+	ProviderWait *ProviderGate  `json:"provider_wait,omitempty"`
+	// ProviderWaits lists every active gate; ProviderWait is the earliest-ending one.
+	ProviderWaits []ProviderGate `json:"provider_waits,omitempty"`
 }
 
 type ProviderGate struct {
-	Until  time.Time `json:"until"`
-	Reason string    `json:"reason"`
+	Provider string    `json:"provider,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Until    time.Time `json:"until"`
+	Reason   string    `json:"reason"`
+}
+
+// GateKey identifies an account gate. A model-specific limit is keyed by provider and model.
+func GateKey(provider, model string) string {
+	if model == "" {
+		return provider
+	}
+	return provider + "/" + model
 }

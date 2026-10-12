@@ -879,7 +879,9 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 	return v, nil
 }
 
-func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue, retry bool) (core.Attempt, error) {
+// enqueueIssue claims an issue for an operator request; trigger applies to
+// unsupervised issues, since a supervisor's children always run as "supervisor".
+func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue, retry bool, trigger string) (core.Attempt, error) {
 	e.supervisorMu.Lock()
 	defer e.supervisorMu.Unlock()
 	if i.Supervisor() {
@@ -890,7 +892,7 @@ func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue,
 		return core.Attempt{}, err
 	}
 	if owner == "" {
-		return e.Store.Enqueue(p, i, "manual", retry)
+		return e.Store.Enqueue(p, i, trigger, retry)
 	}
 	var v core.Supervisor
 	if err = e.Store.Get("supervisor", owner, &v); err != nil {
@@ -917,7 +919,8 @@ func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue,
 	if !v.Selected(i.Number) {
 		as, _ := core.List[core.Attempt](e.Store, "attempt")
 		a := latestChild(as, p.ID, i.Number)
-		failed := a != nil && a.SupervisorID == v.ID && (a.State == "needs_attention" || a.State == "cancelled")
+		// A failed child, or a delivered one the operator sends back for rework.
+		failed := a != nil && a.SupervisorID == v.ID && (a.State == "needs_attention" || a.State == "cancelled" || (retry && a.State == "awaiting_review"))
 		if !failed {
 			return core.Attempt{}, fmt.Errorf("supervisor gate: #%d is not ready (%s)", i.Number, v.Reason)
 		}
