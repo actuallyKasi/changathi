@@ -2,7 +2,7 @@
 
 Changathi is a personal coding-agent orchestrator. One Go daemon watches GitHub issues across your repositories, runs a coding agent (Codex or Claude) on each one in its own Git worktree, validates the agent's commits, optionally has a second model verify them, opens a PR and merges it when checks pass. The issue then stays open with `agent:review` until you review the result and close it.
 
-You don't drive it by hand. The CLI is built for Claude: install the bundled skill and ask Claude to onboard repositories, write issues, and check on agents. You review results and ask for rework on GitHub itself. This README covers installation and how the system fits together; the day-to-day procedures live in the skill ([skills/changathi/SKILL.md](skills/changathi/SKILL.md)).
+You don't drive it by hand. The CLI is built to be operated by Claude Code: install the bundled skill and ask Claude to onboard repositories, write issues, and check on agents. That is separate from the agents that do the issue work, which can be Codex or Claude per repository. You review results and ask for rework on GitHub itself. This README covers installation and how the system fits together; the day-to-day procedures live in the skill ([skills/changathi/SKILL.md](skills/changathi/SKILL.md)).
 
 ## Getting started
 
