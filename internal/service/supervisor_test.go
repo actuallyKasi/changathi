@@ -147,7 +147,7 @@ func ownedAttempts(t *testing.T, e *Engine) []core.Attempt {
 	}
 	return as
 }
-func TestSupervisorSerialHumanReviewAndRestart(t *testing.T) {
+func TestSupervisorHumanReviewAndRestart(t *testing.T) {
 	e, g, p := supervisorSetup(t)
 	ctx := context.Background()
 	e.poll(ctx)
@@ -261,7 +261,12 @@ func TestSupervisorClosureFailures(t *testing.T) {
 			}
 			e.poll(ctx)
 			v, _ := e.Store.SupervisorFor(p.ID, 2)
-			if v.State != "needs_attention" || len(ownedAttempts(t, e)) != 1 {
+			want := "needs_attention"
+			if mode == "operational" {
+				// Missing evidence waits on the child without holding other branches.
+				want = "waiting_review"
+			}
+			if v.State != want || len(ownedAttempts(t, e)) != 1 {
 				t.Fatal(v)
 			}
 			if mode == "operational" || mode == "bot" || mode == "automatic" {
@@ -538,8 +543,8 @@ func TestGitHubEvidenceApprovalAdvancesWithoutCLI(t *testing.T) {
 	g.close(3, "completed")
 	e.poll(ctx)
 	v, _ := e.Store.SupervisorFor(p.ID, 2)
-	if !evidenceHold(v) {
-		t.Fatalf("expected evidence hold: %+v", v)
+	if v.Hold != "" || v.State != "waiting_review" || childStatus(v, 3).Reason != evidencePending || len(ownedAttempts(t, e)) != 1 {
+		t.Fatalf("expected evidence wait: %+v", v)
 	}
 	a := latestChild(ownedAttempts(t, e), p.ID, 3)
 	comment := core.EvidenceComment{ID: 10, Body: fmt.Sprintf("/approve-evidence #%d https://example.test/report", a.PR), CreatedAt: g.nodes[3].ClosedAt.Add(time.Second)}
@@ -625,5 +630,51 @@ func TestApprovalPromptContainsExactCommand(t *testing.T) {
 	}
 	if !strings.Contains(g.pads["plan/approval/3"], "/approve-evidence #14 ") {
 		t.Fatal("stale PR prompt")
+	}
+}
+
+func TestSupervisorRunsIndependentChildrenInParallel(t *testing.T) {
+	e, g, p := supervisorSetup(t)
+	ctx := context.Background()
+	// 3 and 5 are independent; 4 depends on 3.
+	g.edit(2, func(i *core.Issue) {
+		i.Body = strings.TrimSuffix(i.Body, "```") + "  - issue: 5\n```"
+	})
+	v := actionSuper(t, e, p, "start", false)
+	as := ownedAttempts(t, e)
+	if len(as) != 2 || v.State != "waiting_capacity" {
+		t.Fatal(v, as)
+	}
+	queued := map[int]bool{}
+	for _, a := range as {
+		queued[a.Issue.Number] = true
+	}
+	if !queued[3] || !queued[5] {
+		t.Fatal(as)
+	}
+	// A failed independent child does not hold the rest of the plan.
+	a5 := latestChild(as, p.ID, 5)
+	_ = e.Store.UpdateAttempt(a5.ID, func(a *core.Attempt) error { a.State = "needs_attention"; a.Error = "validation failed"; return nil })
+	e.poll(ctx)
+	v, _ = e.Store.SupervisorFor(p.ID, 2)
+	a3 := latestChild(ownedAttempts(t, e), p.ID, 3)
+	if v.Hold != "" || v.State != "needs_attention" || a3.State == "cancelled" {
+		t.Fatal(v, a3)
+	}
+	if err := e.eligible(ctx, p, *a3); err != nil {
+		t.Fatal("sibling failure blocked running child:", err)
+	}
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], false); err == nil {
+		t.Fatal("failed child restarted without retry")
+	}
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], true); err != nil {
+		t.Fatal(err)
+	}
+	if a := latestChild(ownedAttempts(t, e), p.ID, 5); a.State != "queued" {
+		t.Fatal(a)
+	}
+	// The dependent child still waits for its prerequisite.
+	if latestChild(ownedAttempts(t, e), p.ID, 4) != nil {
+		t.Fatal("dependent child dispatched early")
 	}
 }

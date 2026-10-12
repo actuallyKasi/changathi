@@ -45,9 +45,68 @@ func (r *Renderer) accent(s string) string {
 	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(c)).Render(s)
 }
 
+func (r *Renderer) muted(s string) string {
+	if r.plain {
+		return s
+	}
+	c := "#7C869C"
+	if !r.dark {
+		c = "#6B7280"
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(s)
+}
+
+func duration(ms int64) string {
+	if ms >= 60_000 {
+		return fmt.Sprintf("%dm%02ds", ms/60_000, ms/1000%60)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
+}
+
+// divider renders lifecycle changes and turn boundaries as a single marker line.
+func (r *Renderer) divider(i Item, selected bool) string {
+	parts := []string{i.Title}
+	if i.Kind == "turn" {
+		parts[0] = "Turn " + strings.ReplaceAll(i.Status, "_", " ")
+		if i.DurationMS > 0 {
+			parts = append(parts, duration(i.DurationMS))
+		}
+	}
+	detail := strings.Join(strings.Fields(i.Text), " ")
+	failed := i.Kind == "turn" && i.Status != "completed"
+	if detail != "" && !failed {
+		parts = append(parts, detail)
+	}
+	line := "── " + strings.Join(parts, " · ") + " ──"
+	if selected {
+		line = "> " + line
+	}
+	line = ansi.Truncate(line, r.width, "…")
+	if failed {
+		line = r.accent(line)
+		if i.Text != "" {
+			line += "\n" + ansi.Wrap(i.Text, r.width, "")
+		}
+	} else {
+		line = r.muted(line)
+	}
+	return line + "\n\n"
+}
+
 func (r *Renderer) Render(i Item, expanded, selected bool) string {
 	if c, ok := r.cache[i.Key]; ok && c.revision == i.Revision && c.expanded == expanded && c.selected == selected {
 		return c.text
+	}
+	if i.Kind == "lifecycle" || i.Kind == "turn" {
+		text := r.divider(i, selected)
+		if r.plain {
+			text = ansi.Strip(text)
+		}
+		if len(r.cache) >= MaxItems {
+			clear(r.cache)
+		}
+		r.cache[i.Key] = cached{i.Revision, expanded, selected, text}
+		return text
 	}
 	title := i.Title
 	if title == "" {

@@ -12,7 +12,7 @@ The supervisor is a durable daemon controller. Dependency checking and dispatch 
 
 ## 2. Scope and defaults
 
-V1 supports one repository per plan, existing child issues, a directed acyclic dependency graph, and at most one unfinished child execution per plan. Global/project implementation concurrency remains authoritative. Independent work in other plans or projects may proceed while a plan waits for review.
+V1 supports one repository per plan, existing child issues, and a directed acyclic dependency graph. Every child whose prerequisites are satisfied may be queued at once; global/project implementation concurrency alone limits how many run, so a single-session provider account is expressed as global `concurrency: 1`, not as plan serialization. Independent work in other plans or projects may proceed while a plan waits for review.
 
 V1 excludes cross-repository dependencies, nested supervisors, automatic issue decomposition, autonomous prerequisite skipping, and automatic infrastructure authorization. Parent/child issue creation is an operator action. The supervisor never closes issues on the operator's behalf.
 
@@ -95,9 +95,9 @@ Each reconciliation pass:
 1. Check project enablement, parent state/label, activation, plan revision, and cancellation state.
 2. Refresh child issue/PR/review evidence. Unknown remote state blocks dependent dispatch; retain the previous snapshot for display only.
 3. Reconcile any owned attempt with the existing delivery state machine.
-4. If this plan has an unfinished child (including awaiting human review, retry, CI wait, or attention), wait with a concrete reason.
-5. Select the first open child in plan order whose prerequisites satisfy their gates. Completed children are skipped; closed-but-unsatisfied children block the plan.
-6. Atomically claim/enqueue it with trigger `supervisor`, plan ID/revision, child issue ID, and execution generation. The existing scheduler applies project/global capacity and fairness.
+4. Classify every unfinished child: in progress, awaiting human review or evidence, needing attention, or ready (all prerequisites satisfied and no owned attempt). Report them all with concrete reasons.
+5. Select every ready child, in plan order. Completed children are skipped; a closed-but-unsatisfied child (other than one waiting for evidence approval) holds the whole plan.
+6. Atomically claim/enqueue each with trigger `supervisor`, plan ID/revision, child issue ID, and execution generation. The existing scheduler applies project/global capacity and fairness.
 7. Publish progress only when the persisted state changes.
 
 The supervisor does not add `agent:ready` to children. Owned children must be excluded from ordinary label-based auto pickup. Manual `issue run/retry` for an enrolled child routes through the same dependency gate and ownership checks; it cannot bypass prerequisites. Reject execution while the parent is paused/cancelled, with instructions for operator reconciliation.
@@ -116,7 +116,7 @@ Every waiting/attention state stores a reason and wake condition. After all chil
 
 `cancel` stops scheduling and owned active execution, preserving results. Resuming a cancelled plan requires an explicit retry/reconciliation action. Project pause has equivalent execution restrictions. Removing the parent label pauses it and prevents subsequent delivery. Pausing/cancelling a parent never closes child issues or discards their work.
 
-A child failure exhausts existing bounded retries before placing the plan in `needs_attention`. Never skip, close, or relabel a failed prerequisite as completed to continue. V1 does not continue other branches of the same plan around a blocked child; other plans remain schedulable.
+A child failure exhausts existing bounded retries before marking that child as needing attention; the plan reports `needs_attention` but is not held, so independent branches keep running and only the failed child's descendants wait. `issue retry` re-queues the failed child. Never skip, close, or relabel a failed prerequisite as completed to continue.
 
 ## 8. Persistence and restart recovery
 
@@ -205,3 +205,7 @@ Automated verification uses fake GitHub/provider adapters and local Git reposito
 Operational evidence can be approved directly on the child issue after closing it as completed. The daemon posts the exact `/approve-evidence #PR HTTPS_URL` comment to copy, with the current PR and validation report link already filled in. The parent workpad mirrors this action. Only a new, unedited comment by the authenticated human operator after the current closure qualifies. All existing merged-delivery checks remain required. Valid approval releases an evidence-only hold automatically; it does not override explicit pause/cancel or other dependency failures. GitHub comment approvals are revalidated, including deletion or edits, on subsequent reconciliation. CLI acknowledgement remains a fallback.
 
 Old awaiting-review attempts become superseded when replaced by a new generation. Startup repairs historical stale rows. Superseded attempts are inactive, retain audit history, and never consume a worker slot.
+
+## Parallel children (2026-10-12)
+
+The original one-unfinished-child rule existed because the operator's Codex plan allowed one concurrent session. That is now expressed as the global default `concurrency: 1`. The supervisor records every selected child in `ready` (with `current` kept as a display hint) and queues them all; the scheduler runs them as capacity allows. A child waiting for `/approve-evidence` is a per-child wait rather than a plan-wide hold, and a failed or cancelled child no longer cancels running siblings. Plan-wide holds remain for graph changes, label removal, pauses, unsatisfied closures, and regressed prerequisites of dispatched children.

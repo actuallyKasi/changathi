@@ -62,7 +62,11 @@ func (e *Engine) state(id, state, reason string) {
 		a.Error = reason
 		return nil
 	})
-	_ = e.Store.Event(id, "state", state+": "+reason)
+	text := state
+	if reason != "" {
+		text += ": " + reason
+	}
+	_ = e.Store.Event(id, "state", text)
 }
 func (e *Engine) current(id string) (core.Attempt, error) {
 	var a core.Attempt

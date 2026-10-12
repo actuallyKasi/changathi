@@ -95,3 +95,46 @@ func BenchmarkLargeTranscriptRender(b *testing.B) {
 		}
 	}
 }
+
+func TestLegacyProtocolEventsAndLifecycle(t *testing.T) {
+	var tr Transcript
+	at := func(seq int64, typ, text string) core.Event {
+		return core.Event{Seq: seq, Type: typ, Text: text, Created: time.Unix(seq, 0)}
+	}
+	for _, e := range []core.Event{
+		at(1, "turn/started", `{"threadId":"x","turn":{"id":"t"}}`),
+		at(2, "item/agentMessage/delta", "Implemen"),
+		at(3, "item/completed", `{"item":{"id":"m","type":"agentMessage","text":"Implemented it."}}`),
+		at(4, "item/completed", `{"item":{"id":"f","type":"fileChange","changes":[{"path":"a.yaml","diff":"+kind: Init"}]}}`),
+		at(5, "thread/status/changed", `{"threadId":"x","status":{"type":"idle"}}`),
+		at(6, "turn/completed", `{"threadId":"x","turn":{"id":"t","status":"completed","error":null,"durationMs":168035}}`),
+		at(7, "state", "validating: "),
+		at(8, "state", "awaiting_review: waiting for human review"),
+		at(9, "turn/completed", `{"turn":{"id":"u","status":"completed"` /* truncated legacy text */),
+		at(10, "turn/completed", `{"turn":{"id":"v","status":"completed","durationMs":2000}}`),
+	} {
+		tr.Apply(e)
+	}
+	kinds := []string{}
+	for _, i := range tr.Items {
+		kinds = append(kinds, i.Kind+":"+i.Title)
+	}
+	want := "assistant:,diff:File changes,turn:,lifecycle:Validating,lifecycle:Ready for review,turn:"
+	if strings.Join(kinds, ",") != want {
+		t.Fatalf("%v", kinds)
+	}
+	if tr.Items[0].Text != "Implemented it." || tr.Items[2].DurationMS != 168035 || tr.Items[3].Text != "" {
+		t.Fatalf("%+v", tr.Items)
+	}
+	r := NewRenderer(80, true, true)
+	if got := r.Render(tr.Items[2], false, false); got != "── Turn completed · 2m48s ──\n\n" {
+		t.Fatalf("%q", got)
+	}
+	if got := r.Render(tr.Items[4], false, false); got != "── Ready for review · waiting for human review ──\n\n" {
+		t.Fatalf("%q", got)
+	}
+	failed := Item{Key: "f", Kind: "turn", Status: "failed", Text: "boom", DurationMS: 1500}
+	if got := r.Render(failed, false, false); got != "── Turn failed · 1.5s ──\nboom\n\n" {
+		t.Fatalf("%q", got)
+	}
+}

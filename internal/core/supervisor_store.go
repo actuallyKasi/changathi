@@ -136,7 +136,7 @@ func (s *Store) EnqueueSupervised(p Project, i Issue, plan Supervisor, retry boo
 	if err := s.Get("supervisor", plan.ID, &current); err != nil {
 		return Attempt{}, err
 	}
-	if current.Revision != plan.Revision || current.Hold != "" || current.Current != i.Number {
+	if current.Revision != plan.Revision || current.Hold != "" || !current.Selected(i.Number) {
 		return Attempt{}, fmt.Errorf("supervisor changed or child is not selected")
 	}
 	as, err := List[Attempt](s, "attempt")
@@ -147,11 +147,6 @@ func (s *Store) EnqueueSupervised(p Project, i Issue, plan Supervisor, retry boo
 	for _, a := range as {
 		if a.ProjectID == p.ID && a.Generation > latest[a.Issue.ID].Generation {
 			latest[a.Issue.ID] = a
-		}
-	}
-	for _, a := range latest {
-		if a.SupervisorID == plan.ID && a.Issue.ID != i.ID && a.State != "done" {
-			return Attempt{}, fmt.Errorf("supervisor still owns unfinished child #%d", a.Issue.Number)
 		}
 	}
 	// Explicit enrollment may resume an inactive previous attempt. Active and

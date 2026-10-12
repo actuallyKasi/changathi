@@ -239,7 +239,7 @@ func (s *codexSession) Run(ctx context.Context, prompt string, emit func(Event))
 			if text == "" {
 				text = string(v.Params)
 			}
-			emit(Event{Type: v.Method, Text: text, Turn: start.Turn.ID, Output: normalizeOutput(v.Method, v.Params, start.Turn.ID)})
+			emit(Event{Type: v.Method, Text: text, Turn: start.Turn.ID, Output: NormalizeOutput(v.Method, v.Params, start.Turn.ID)})
 			if v.Method == "turn/completed" && p.Turn.ID == start.Turn.ID {
 				if p.Turn.Status != "completed" {
 					if p.Turn.Error != nil {

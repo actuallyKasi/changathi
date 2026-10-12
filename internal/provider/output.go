@@ -7,13 +7,21 @@ import (
 	"strings"
 )
 
-// normalizeOutput keeps wire method names/raw text for diagnostics, alongside a
+// NormalizeOutput keeps wire method names/raw text for diagnostics, alongside a
 // portable payload for replay. Unknown provider items are left in the raw view.
-func normalizeOutput(method string, raw json.RawMessage, turn string) *core.Output {
+func NormalizeOutput(method string, raw json.RawMessage, turn string) *core.Output {
 	var p struct {
 		ItemID string `json:"itemId"`
 		Delta  string `json:"delta"`
-		Item   struct {
+		Turn   struct {
+			ID         string `json:"id"`
+			Status     string `json:"status"`
+			DurationMS int64  `json:"durationMs"`
+			Error      *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"turn"`
+		Item struct {
 			ID               string          `json:"id"`
 			Type             string          `json:"type"`
 			Text             string          `json:"text"`
@@ -43,6 +51,15 @@ func normalizeOutput(method string, raw json.RawMessage, turn string) *core.Outp
 		o.ItemID = "legacy-" + turn + "-" + method
 	}
 	switch method {
+	case "turn/completed":
+		o.Kind, o.ItemID, o.Mode, o.Text = "turn", "turn-"+p.Turn.ID, "snapshot", ""
+		o.Status, o.DurationMS = p.Turn.Status, p.Turn.DurationMS
+		if o.Status == "" {
+			o.Status = "completed"
+		}
+		if p.Turn.Error != nil {
+			o.Text = p.Turn.Error.Message
+		}
 	case "item/agentMessage/delta":
 		o.Kind = "assistant"
 	case "item/commandExecution/outputDelta":

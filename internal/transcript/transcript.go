@@ -3,6 +3,8 @@ package transcript
 
 import (
 	"changathi/internal/core"
+	"changathi/internal/provider"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -91,13 +93,23 @@ func (t *Transcript) Apply(e core.Event) {
 		t.Last = e.Seq
 	}
 	o := e.Output
-	if o == nil {
-		if e.Version > 0 && strings.Contains(e.Type, "/") {
+	if o == nil && strings.Contains(e.Type, "/") {
+		// Records without a stored payload (legacy, or written before a method was
+		// normalized) keep the raw params as text. Legacy deltas hold bare text with
+		// no item identity; their completed snapshot carries the full message.
+		o = provider.NormalizeOutput(e.Type, json.RawMessage(e.Text), e.TurnID)
+		if o == nil {
 			// Protocol bookkeeping remains available in the raw view.
 			return
 		}
-		// Legacy records preserve actual event boundaries, without guessing items.
-		if e.Type == "session_started" || e.Type == "account/rateLimits/updated" {
+	}
+	if o == nil {
+		switch e.Type {
+		case "session_started":
+			return
+		case "state":
+			state, reason, _ := strings.Cut(e.Text, ":")
+			t.put(Item{Key: fmt.Sprintf("event:%d", e.Seq), Kind: "lifecycle", Title: StateLabel(Clean(state)), Text: bounded(Clean(strings.TrimSpace(reason))), Created: e.Created, Complete: true})
 			return
 		}
 		t.put(Item{Key: fmt.Sprintf("event:%d", e.Seq), Kind: "event", Title: Clean(e.Type), Text: bounded(Clean(e.Text)), Created: e.Created, Complete: true})

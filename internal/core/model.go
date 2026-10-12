@@ -33,7 +33,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	h, _ := os.UserHomeDir()
-	return Config{DataDir: filepath.Join(h, ".local", "share", "changathi"), Concurrency: 2, PollSeconds: 30, Codex: "codex", MaxLogBytes: 16 * 1024 * 1024, EventLimit: 10000}
+	return Config{DataDir: filepath.Join(h, ".local", "share", "changathi"), Concurrency: 1, PollSeconds: 30, Codex: "codex", MaxLogBytes: 16 * 1024 * 1024, EventLimit: 10000}
 }
 func (c Config) Socket() string { return filepath.Join(c.DataDir, "daemon.sock") }
 func (c Config) Validate() error {

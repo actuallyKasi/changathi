@@ -1,6 +1,6 @@
 # Replace this path with your own absolute state directory.
 data_dir: /Users/you/.local/share/changathi
-concurrency: 2
+concurrency: 1
 poll_seconds: 30
 codex: codex
 max_log_bytes: 16777216

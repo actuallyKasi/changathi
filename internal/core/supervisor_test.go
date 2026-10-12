@@ -42,7 +42,7 @@ func TestSupervisorAtomicOwnership(t *testing.T) {
 	defer s.Close()
 	p := Project{ID: ID(), RepoID: 1, Name: "test"}
 	i := Issue{ID: 2, Number: 2, State: "open"}
-	v := Supervisor{ID: ID(), ProjectID: p.ID, Parent: Issue{ID: 1, Number: 1}, Revision: "rev", Plan: SupervisorPlan{Version: 1, Children: []SupervisorChild{{Issue: 2}}}, Evidence: map[int]ChildEvidence{2: {IssueID: 2}}, Current: 2}
+	v := Supervisor{ID: ID(), ProjectID: p.ID, Parent: Issue{ID: 1, Number: 1}, Revision: "rev", Plan: SupervisorPlan{Version: 1, Children: []SupervisorChild{{Issue: 2}}}, Evidence: map[int]ChildEvidence{2: {IssueID: 2}}, Current: 2, Ready: []int{2}}
 	if err = s.EnrollSupervisor(v); err != nil {
 		t.Fatal(err)
 	}

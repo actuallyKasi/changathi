@@ -236,7 +236,8 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 			}
 		}
 	}
-	if evidenceHold(*v) && done[v.Current] {
+	// Evidence approval is a per-child wait now, never a plan-wide hold.
+	if evidenceHold(*v) {
 		v.Hold = ""
 	}
 	if v.Hold == "attention" {
@@ -293,48 +294,48 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 		v.Reason = "all children complete; close the parent after review"
 		return issues, nil
 	}
-	// Any unfinished attempt serializes this plan, including review and retry waits.
+	// Every child whose prerequisites are satisfied is selected. Worker capacity is
+	// limited by the global and project concurrency settings, not by the plan.
+	// A failed child blocks only its own descendants; other branches continue.
+	v.Ready = nil
+	var running, review, blocked []int
+	var notes []string
 	for _, c := range v.Plan.Children {
 		if done[c.Issue] {
 			continue
 		}
 		a := latestChild(as, p.ID, c.Issue)
 		if issues[c.Issue].State == "closed" {
+			reason := childStatus(*v, c.Issue).Reason
+			if reason == evidencePending {
+				review = append(review, c.Issue)
+				notes = append(notes, fmt.Sprintf("#%d: %s", c.Issue, reason))
+				continue
+			}
 			v.Current = c.Issue
 			v.State = "needs_attention"
 			v.Hold = "attention"
-			v.Reason = fmt.Sprintf("#%d: %s", c.Issue, childStatus(*v, c.Issue).Reason)
+			v.Reason = fmt.Sprintf("#%d: %s", c.Issue, reason)
 			return issues, nil
 		}
-		if a == nil || a.SupervisorID != v.ID {
-			continue
-		}
-		v.Current = c.Issue
-		switch a.State {
-		case "awaiting_review":
-			v.State = "waiting_review"
-			v.Reason = fmt.Sprintf("waiting for human completion of #%d", c.Issue)
-		case "needs_attention":
-			v.State = "needs_attention"
-			v.Hold = "attention"
-			v.Reason = fmt.Sprintf("#%d: %s", c.Issue, a.Error)
-		case "cancelled":
-			if a.Error == "supervisor interrupted" {
-				v.State = "active"
-				v.Reason = "resume interrupted child"
-			} else {
-				v.State = "needs_attention"
-				v.Hold = "attention"
-				v.Reason = fmt.Sprintf("child #%d cancelled; explicitly retry it", c.Issue)
+		if a != nil && a.SupervisorID == v.ID {
+			switch {
+			case a.State == "awaiting_review":
+				review = append(review, c.Issue)
+				notes = append(notes, fmt.Sprintf("waiting for human completion of #%d", c.Issue))
+			case a.State == "needs_attention":
+				blocked = append(blocked, c.Issue)
+				notes = append(notes, fmt.Sprintf("#%d: %s", c.Issue, a.Error))
+			case a.State == "cancelled" && a.Error == "supervisor interrupted":
+				v.Ready = append(v.Ready, c.Issue)
+				notes = append(notes, fmt.Sprintf("resume interrupted child #%d", c.Issue))
+			case a.State == "cancelled":
+				blocked = append(blocked, c.Issue)
+				notes = append(notes, fmt.Sprintf("child #%d cancelled; explicitly retry it", c.Issue))
+			default:
+				running = append(running, c.Issue)
+				notes = append(notes, fmt.Sprintf("#%d: %s", c.Issue, a.State))
 			}
-		default:
-			v.State = "waiting_child"
-			v.Reason = fmt.Sprintf("#%d: %s", c.Issue, a.State)
-		}
-		return issues, nil
-	}
-	for _, c := range v.Plan.Children {
-		if done[c.Issue] {
 			continue
 		}
 		ready := true
@@ -343,22 +344,38 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 				ready = false
 			}
 		}
-		if ready {
-			if c.Completion == "closed_completed" {
-				v.Current = c.Issue
-				v.State = "waiting_review"
-				v.Reason = fmt.Sprintf("manual completion required for #%d (no code delivery)", c.Issue)
-				return issues, nil
-			}
-			v.Current = c.Issue
-			v.State = "active"
-			v.Reason = fmt.Sprintf("next child #%d", c.Issue)
-			return issues, nil
+		if !ready {
+			continue
 		}
+		if c.Completion == "closed_completed" {
+			review = append(review, c.Issue)
+			notes = append(notes, fmt.Sprintf("manual completion required for #%d (no code delivery)", c.Issue))
+			continue
+		}
+		v.Ready = append(v.Ready, c.Issue)
+		notes = append(notes, fmt.Sprintf("next child #%d", c.Issue))
 	}
 	v.Current = 0
-	v.State = "waiting_child"
-	v.Reason = "waiting for dependencies"
+	for _, group := range [][]int{v.Ready, running, review, blocked} {
+		if len(group) > 0 {
+			v.Current = group[0]
+			break
+		}
+	}
+	v.Reason = strings.Join(notes, "; ")
+	switch {
+	case len(blocked) > 0:
+		v.State = "needs_attention"
+	case len(v.Ready) > 0:
+		v.State = "active"
+	case len(running) > 0:
+		v.State = "waiting_child"
+	case len(review) > 0:
+		v.State = "waiting_review"
+	default:
+		v.State = "waiting_child"
+		v.Reason = "waiting for dependencies"
+	}
 	return issues, nil
 }
 func childStatus(v core.Supervisor, n int) core.ChildStatus {
@@ -518,30 +535,37 @@ func (e *Engine) reconcileSupervisor(ctx context.Context, p core.Project, v core
 	if err := e.Store.Put("supervisor", v.ID, v); err != nil {
 		return err
 	}
-	if v.State == "active" && v.Hold == "" && v.Current != 0 {
+	if v.Hold == "" && len(v.Ready) > 0 {
 		as, err := core.List[core.Attempt](e.Store, "attempt")
 		if err != nil {
 			return err
 		}
-		old := latestChild(as, p.ID, v.Current)
-		retry := old != nil && old.SupervisorID == v.ID && old.State == "cancelled" && old.Error == "supervisor interrupted"
-		// Wait for a cancelled provider process to exit before reusing its generation.
-		e.mu.Lock()
-		busy := false
-		if old != nil {
-			_, busy = e.workers[old.ID]
-		}
-		e.mu.Unlock()
-		if !busy {
-			a, err := e.Store.EnqueueSupervised(p, issues[v.Current], v, retry)
+		var queued []string
+		for _, n := range v.Ready {
+			old := latestChild(as, p.ID, n)
+			retry := old != nil && old.SupervisorID == v.ID && old.State == "cancelled" && old.Error == "supervisor interrupted"
+			// Wait for a cancelled provider process to exit before reusing its generation.
+			e.mu.Lock()
+			busy := false
+			if old != nil {
+				_, busy = e.workers[old.ID]
+			}
+			e.mu.Unlock()
+			if busy {
+				continue
+			}
+			a, err := e.Store.EnqueueSupervised(p, issues[n], v, retry)
 			if err != nil {
 				v.State = "needs_attention"
 				v.Hold = "attention"
 				v.Reason = err.Error()
-			} else {
-				v.State = "waiting_capacity"
-				v.Reason = fmt.Sprintf("#%d queued (%s)", v.Current, a.ID)
+				break
 			}
+			queued = append(queued, fmt.Sprintf("#%d queued (%s)", n, a.ID))
+		}
+		if len(queued) > 0 && v.State == "active" {
+			v.State = "waiting_capacity"
+			v.Reason = strings.Join(queued, "; ")
 		}
 	}
 	return e.saveSupervisor(ctx, p, &v)
@@ -610,14 +634,14 @@ func (e *Engine) supervisorGateLocked(ctx context.Context, p core.Project, a cor
 	if err = e.Store.Get("supervisor", owner, &v); err != nil {
 		return err
 	}
-	if v.Hold != "" || v.State == "done" || v.Revision != a.PlanRevision || v.Current != a.Issue.Number {
-		return fmt.Errorf("supervisor is paused, changed, complete, or has selected another child")
+	if v.Hold != "" || v.State == "done" || v.Revision != a.PlanRevision {
+		return fmt.Errorf("supervisor is paused, changed, or complete")
 	}
 	issues, err := e.inspectSupervisor(ctx, p, &v)
 	if err != nil {
 		return err
 	}
-	if v.Hold != "" || v.Parent.State != "open" || v.Current != a.Issue.Number || issues[a.Issue.Number].State != "open" {
+	if v.Hold != "" || v.Parent.State != "open" || issues[a.Issue.Number].State != "open" {
 		return fmt.Errorf("supervisor gate: %s", v.Reason)
 	}
 	for _, c := range v.Plan.Children {
@@ -759,6 +783,7 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 		v.State = "paused"
 		v.Reason = "plan reloaded; resume to dispatch"
 		v.Current = 0
+		v.Ready = nil
 		v.Children = nil
 		if err = e.Store.EnrollSupervisor(v); err != nil {
 			return nil, err
@@ -878,27 +903,28 @@ func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue,
 		return core.Attempt{}, fmt.Errorf("resume the parent first")
 	}
 	// Explicit retry clears a child failure only, never graph/dependency gates.
-	original := v.Hold
-	if retry && v.Current == i.Number && v.Hold == "attention" {
+	// Older records may still carry a plan-wide hold for this child's failure.
+	if retry && v.Hold == "attention" && (strings.HasPrefix(v.Reason, fmt.Sprintf("#%d:", i.Number)) || strings.HasPrefix(v.Reason, fmt.Sprintf("child #%d cancelled", i.Number))) {
 		v.Hold = ""
 	}
 	issues, err := e.inspectSupervisor(ctx, p, &v)
 	if err != nil {
 		return core.Attempt{}, err
 	}
-	if v.Hold == "attention" && retry && v.Current == i.Number {
-		as, _ := core.List[core.Attempt](e.Store, "attempt")
-		a := latestChild(as, p.ID, i.Number)
-		if a != nil && (a.State == "needs_attention" || a.State == "cancelled") && (strings.HasPrefix(v.Reason, fmt.Sprintf("#%d:", i.Number)) || strings.HasPrefix(v.Reason, fmt.Sprintf("child #%d cancelled", i.Number))) {
-			v.Hold = ""
-			v.State = "active"
-		}
-	}
-	if v.Hold != "" || v.Current != i.Number || issues[i.Number].State != "open" {
+	if v.Hold != "" || issues[i.Number].State != "open" {
 		return core.Attempt{}, fmt.Errorf("supervisor gate: %s", v.Reason)
 	}
-	if original == "attention" && !retry {
-		return core.Attempt{}, fmt.Errorf("supervisor needs attention; use retry/reconcile")
+	if !v.Selected(i.Number) {
+		as, _ := core.List[core.Attempt](e.Store, "attempt")
+		a := latestChild(as, p.ID, i.Number)
+		failed := a != nil && a.SupervisorID == v.ID && (a.State == "needs_attention" || a.State == "cancelled")
+		if !failed {
+			return core.Attempt{}, fmt.Errorf("supervisor gate: #%d is not ready (%s)", i.Number, v.Reason)
+		}
+		if !retry {
+			return core.Attempt{}, fmt.Errorf("child #%d needs attention; use retry", i.Number)
+		}
+		v.Ready = append(v.Ready, i.Number)
 	}
 	if err = e.Store.Put("supervisor", v.ID, v); err != nil {
 		return core.Attempt{}, err

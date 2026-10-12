@@ -59,6 +59,7 @@ type Supervisor struct {
 	Reason          string                 `json:"reason,omitempty"`
 	Hold            string                 `json:"hold,omitempty"`
 	Current         int                    `json:"current,omitempty"`
+	Ready           []int                  `json:"ready,omitempty"`
 	Evidence        map[int]ChildEvidence  `json:"evidence"`
 	Children        []ChildStatus          `json:"children"`
 	CommentID       int64                  `json:"comment_id,omitempty"`
@@ -186,4 +187,14 @@ func (s Supervisor) Child(n int) (SupervisorChild, bool) {
 		}
 	}
 	return SupervisorChild{}, false
+}
+
+// Selected reports whether the latest reconciliation chose child n for dispatch.
+func (v Supervisor) Selected(n int) bool {
+	for _, x := range v.Ready {
+		if x == n {
+			return true
+		}
+	}
+	return false
 }
