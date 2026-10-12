@@ -162,19 +162,3 @@ func (a *app) showSupervisor(v core.Supervisor) error {
 	}
 	return w.Flush()
 }
-
-func (a *app) workspaces(attempts []core.Attempt) error {
-	if a.json {
-		return a.print(attempts)
-	}
-	if len(attempts) == 0 {
-		_, err := fmt.Fprintln(a.out, "No workspaces found.")
-		return err
-	}
-	w := tabwriter.NewWriter(a.out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "AGENT\tISSUE\tSUBJECT\tSTATUS\tPATH")
-	for _, v := range attempts {
-		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\n", singleLine(v.ID), v.Issue.Number, singleLine(v.Issue.Title), strings.ReplaceAll(singleLine(v.State), "_", " "), singleLine(v.Workspace))
-	}
-	return w.Flush()
-}

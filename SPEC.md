@@ -6,7 +6,7 @@ Implementation language: Go. Target platforms: macOS and Linux.
 
 ## 1. Purpose and scope
 
-Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands, a live terminal dashboard, and agent messaging.
+Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands and agent messaging. The CLI is designed to be driven by a coding assistant (Claude) through a bundled skill, so its read commands return compact, bounded output.
 
 The initial provider is Codex. A provider adapter boundary permits a later Claude implementation without replacing scheduling, storage, GitHub integration, or the CLI. Claude execution is outside v1.
 
@@ -21,7 +21,7 @@ MUST and SHOULD identify required behavior and recommended behavior respectively
 - Personal use on macOS or Linux; no multi-user authorization system.
 - Both automatic issue pickup and explicit CLI dispatch.
 - Pull requests may be merged without human approval (Changathi's delivery controller merges; see §7).
-- Commands, a live terminal dashboard, and messages to agents.
+- Commands, an agent-facing skill, and messages to agents.
 - Codex initially, with an extensible provider interface.
 - Git worktrees for per-issue execution.
 
@@ -44,7 +44,7 @@ Components:
 | Agent runner | Provider sessions, turns, messages, events, interruption |
 | Delivery controller | Validated PR publication and merge operations |
 | State store | SQLite records, durable messages, operation journal |
-| Local API | Shared command/dashboard interface and event streaming |
+| Local API | Command interface and event streaming |
 
 The daemon MUST be the sole writer to its database. It MUST acquire an exclusive instance lock before dispatching. SQLite data and workspaces MUST reside on local storage. Running two independent daemons against the same repositories is unsupported in v1 and MUST be documented during setup.
 
@@ -162,40 +162,37 @@ Implementation note:
 - An account limit is recognized from provider error text ("rate limit", "usage limit", or "quota"). It sets a provider-wide gate that pauses all dispatch for five minutes and puts the attempt in `waiting_account`.
 - Messages are steered into the turn only while one is active. Otherwise they are queued and prepended to the next turn. A message sent while an attempt is in `waiting_checks` re-queues it for a new turn. Messages are refused while the controller is validating, publishing, or merging.
 
-## 10. CLI and terminal dashboard
+## 10. CLI and skill
 
-Implemented command surface (all commands accept `--json`):
+The CLI's primary user is a coding assistant, so read commands default to compact, bounded output and never dump unbounded history. Implemented command surface (all commands accept `--json`):
 
 ```text
 changathi daemon start|status|stop
 changathi doctor
+changathi summary
 changathi project add <name> --repo <owner/repo> [--auto] [--concurrency N]
-changathi project list|show|pause|resume
+changathi project list|pause|resume
 changathi issue list --project <name>|--all
 changathi issue show <project>#<number>
-changathi issue create --project <name> --title ... --body-file ...
-changathi issue edit <project>#<number> --body-file ...
-changathi issue label <project>#<number> --add agent:ready
 changathi issue run|retry|cancel <project>#<number>
-changathi issue close <project>#<number>
-changathi agent list
-changathi agent show <attempt-id>
-changathi agent view <attempt-id>
-changathi agent logs <attempt-id> [--follow] [--raw]
+changathi agent list [--active] [--project <name>] [--limit N]
+changathi agent show <attempt-id> [--full]
+changathi agent logs <attempt-id> [--tail N] [--last] [--full] [--follow] [--raw]
 changathi agent message <attempt-id> --text ...
 changathi agent stop <attempt-id>
 changathi supervisor ...            (see SUPERVISOR_SPEC.md)
-changathi watch
 changathi usage
-changathi workspace list
 changathi workspace clean <attempt-id> [--apply]
+changathi skill install [--dir <repo>] [--print]
 ```
 
-`agent view` is the interactive transcript, and `watch` is the dashboard; both are described in [TUI_SPEC.md](TUI_SPEC.md). `doctor` checks that `git`, `gh`, and Codex are on the path and runs `gh auth status` and `codex login status`.
+`summary` reports, in one call, the running agents, the newest attempt for each issue that needs attention or awaits review, active supervisors, messages that are queued or uncertain, paused projects, and any provider pause. `agent list` returns compact rows (id, issue, title, state, PR, one-line detail), newest first, skips superseded generations, and defaults to 20 rows. `agent show` omits the recorded workflow and issue body unless `--full` is given. `agent logs` prints plain text; tool and diff output appears only for failed items unless `--full` is given, and `--tail`/`--last` bound the window. `daemon status --json` remains the full snapshot for debugging.
 
-Commands MUST support explicit project selection, stable exit codes, and `--json` for machine-readable results where meaningful. Mutating commands use request IDs so transport retries do not duplicate actions. CLI issue closure is an explicit human operation, separate from autonomous merge.
+`project add` also creates the `agent:ready`, `agent:review`, and `supervisor` labels and warns when `WORKFLOW.md` is missing from the base branch. Creating, editing, labelling, and closing issues are GitHub operations done with `gh`; Changathi does not wrap them. Issue closure remains an explicit human operation, separate from autonomous merge.
 
-The dashboard shows project queues, active agents, latest activity, PR/check state, messages awaiting delivery, failures, and reported account limits. It consumes the same API as commands. Disconnecting or quitting it does not cancel work. Event streams support reconnection from a sequence cursor or an explicit full refresh if history expired.
+`skill install` writes the skill embedded in the binary (`skills/changathi/SKILL.md`) to `~/.claude/skills/changathi/SKILL.md`, or under `<repo>/.claude/skills/` with `--dir`, so the installed skill always matches the CLI. The skill covers onboarding a repository, writing issues agents can finish, supervisor plans, and checking on and steering agents. `doctor` checks that `git`, `gh`, and Codex are on the path and runs `gh auth status` and `codex login status`.
+
+Commands MUST support explicit project selection, stable exit codes, and `--json` for machine-readable results where meaningful. Mutating commands use request IDs so transport retries do not duplicate actions. Event streams support reconnection from a sequence cursor or an explicit full refresh if history expired.
 
 Messages are durably queued before acknowledgment. Delivery records distinguish queued, sent, acknowledged, and uncertain. On ambiguous provider failure, do not silently duplicate steering messages. The operator can inspect uncertainty and resend deliberately.
 
@@ -229,7 +226,7 @@ Structured logs and CLI diagnostics include project, issue, attempt, and operati
 6. A changed PR head cannot be merged using checks from a previous head.
 7. Restart after PR creation or merge reconciles remote state without duplicate delivery.
 8. Account exhaustion preserves work and pauses dispatch without paid fallback.
-9. Dashboard disconnection leaves agents running; log/event reconnection is supported.
+9. CLI disconnection leaves agents running; log/event reconnection is supported.
 10. Agent messages expose delivery state and survive daemon restart.
 11. Dirty worktrees survive failure and cleanup attempts.
 12. Provider contract tests use a fake provider; Codex integration tests exercise the pinned protocol on macOS and Linux.
@@ -241,7 +238,7 @@ Structured logs and CLI diagnostics include project, issue, attempt, and operati
 2. GitHub reading, manual dispatch, managed worktrees, Codex runner and events.
 3. Automatic polling, fair scheduling, retries, quota handling, restart recovery.
 4. Validation, PR delivery, autonomous merging, confirmed human-review lifecycle.
-5. Issue management commands, messaging, dashboard, service packaging.
+5. Agent-facing commands and skill, messaging, service packaging.
 
 All five stages are implemented. Direct remote client transport, GitHub webhooks, token-reference authentication, GitHub Enterprise hosts, time-based worktree retention, containers, multi-host execution, multiple users, cross-repository tasks, and Claude execution remain outside v1.
 

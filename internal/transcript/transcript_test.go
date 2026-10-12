@@ -52,8 +52,7 @@ func TestLiteralOutputSanitizationAndBounds(t *testing.T) {
 	if !utf8.ValidString(last.Text) || len(last.Text) > MaxText+100 {
 		t.Fatal("unbounded or invalid text")
 	}
-	r := NewRenderer(32, true, true)
-	if strings.Contains(r.Render(last, true, false), "\x1b") {
+	if strings.Contains((Renderer{Full: true}).Render(last), "\x1b") {
 		t.Fatal("plain output contains ANSI")
 	}
 }
@@ -87,11 +86,11 @@ func BenchmarkLargeTranscriptRender(b *testing.B) {
 	for n := range items {
 		items[n] = Item{Key: fmt.Sprint(n), Kind: "assistant", Text: "## Result\n\nThe change passed validation.\n\n```go\nfmt.Println(\"hello\")\n```", Revision: 1}
 	}
-	r := NewRenderer(100, false, true)
+	r := Renderer{Full: true}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		for _, item := range items {
-			r.Render(item, true, false)
+			r.Render(item)
 		}
 	}
 }
@@ -126,15 +125,15 @@ func TestLegacyProtocolEventsAndLifecycle(t *testing.T) {
 	if tr.Items[0].Text != "Implemented it." || tr.Items[2].DurationMS != 168035 || tr.Items[3].Text != "" {
 		t.Fatalf("%+v", tr.Items)
 	}
-	r := NewRenderer(80, true, true)
-	if got := r.Render(tr.Items[2], false, false); got != "── Turn completed · 2m48s ──\n\n" {
+	r := Renderer{}
+	if got := r.Render(tr.Items[2]); got != "── Turn completed · 2m48s ──\n\n" {
 		t.Fatalf("%q", got)
 	}
-	if got := r.Render(tr.Items[4], false, false); got != "── Ready for review · waiting for human review ──\n\n" {
+	if got := r.Render(tr.Items[4]); got != "── Ready for review · waiting for human review ──\n\n" {
 		t.Fatalf("%q", got)
 	}
 	failed := Item{Key: "f", Kind: "turn", Status: "failed", Text: "boom", DurationMS: 1500}
-	if got := r.Render(failed, false, false); got != "── Turn failed · 1.5s ──\nboom\n\n" {
+	if got := r.Render(failed); got != "── Turn failed · 1.5s ──\nboom\n\n" {
 		t.Fatalf("%q", got)
 	}
 }

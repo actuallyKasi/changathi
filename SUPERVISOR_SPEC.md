@@ -150,7 +150,7 @@ changathi supervisor reconcile homelab#PARENT --child 4 --ack-completion --evide
 
 `validate` is read-only and reports schema, dependency, ownership, and eligibility problems. All mutations use request IDs and the local daemon API. Structured `--json` responses include blocked child IDs and precise reasons. No generic force/skip gate is included in v1.
 
-The dashboard shows supervisor state separately from implementation agents, e.g. `homelab#PARENT: waiting_review on #4; #5 blocked by #4`. Supervision must not appear as one active worker or conceal available capacity.
+`summary` and `supervisor list` show supervisor state separately from implementation agents, e.g. `homelab#PARENT: waiting_review on #4; #5 blocked by #4`. Supervision must not appear as one active worker or conceal available capacity.
 
 ## 10. Implementation map
 
@@ -160,7 +160,7 @@ The dashboard shows supervisor state separately from implementation agents, e.g.
 - New `internal/core/supervisor.go`: strict plan parsing, graph validation, pure dependency eligibility evaluation.
 - New `internal/service/supervisor.go`: reconciliation and child handoff into the existing scheduler.
 - `internal/service/engine.go`: shared dependency/parent gates in enqueue, turns, and delivery; exclude parents/owned children from normal automatic pickup. Its current `awaiting_review` logic accepts any closed issue and must not be reused as supervisor completion proof.
-- `internal/service/server.go`, `internal/cli/cli.go`, and `internal/cli/client.go`: API, commands, dashboard, and operator reconciliation.
+- `internal/service/server.go`, `internal/cli/cli.go`, and `internal/cli/client.go`: API, commands, and operator reconciliation.
 
 Repository `WORKFLOW.md` continues to configure implementation agents and validation. Parent issue configuration cannot raise host concurrency, weaken sandbox/credential boundaries, or override merge policy. Existing delivery code remains responsible for PR validation and merging.
 
@@ -187,7 +187,7 @@ Use fake GitHub/provider adapters and a controllable clock. Required tests:
 11. Completing all children leaves the parent awaiting human review. Premature closure, reopening, and unchanged polling do not cause unrequested execution.
 12. Multiple plans/projects remain fair, and unsupervised existing workflows retain their current behavior.
 
-Implement in stages: schema/parser and persistence; read-only validation/status; explicit-start reconciliation and dispatch; lifecycle/recovery tests; automatic discovery and workpad/dashboard; optional advisory agent afterward. Roll out first with a disposable repository and two dependent issues, then a homelab parent. Creating this specification does not start a supervisor or change the existing homelab issues.
+Implement in stages: schema/parser and persistence; read-only validation/status; explicit-start reconciliation and dispatch; lifecycle/recovery tests; automatic discovery and workpad; optional advisory agent afterward. Roll out first with a disposable repository and two dependent issues, then a homelab parent. Creating this specification does not start a supervisor or change the existing homelab issues.
 
 ## Implementation notes
 

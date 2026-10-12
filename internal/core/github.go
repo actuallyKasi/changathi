@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ type GitHub interface {
 	CreatePR(context.Context, Project, Attempt) (*PR, error)
 	Merge(context.Context, Project, *PR, string) error
 	MarkReview(context.Context, Project, int) error
-	MutateIssue(context.Context, Project, int, string, map[string]any) (any, error)
+	Prepare(context.Context, Project) ([]string, error)
 }
 type GH struct{}
 
@@ -150,12 +151,21 @@ func (g GH) Merge(ctx context.Context, p Project, pr *PR, method string) error {
 	_, e := Command(ctx, "", "gh", "pr", "merge", strconv.Itoa(pr.Number), "--repo", p.Repo, "--"+method, "--match-head-commit", pr.Head)
 	return e
 }
-func (g GH) MarkReview(ctx context.Context, p Project, n int) error {
-	if e := g.api(ctx, "repos/"+p.Repo+"/labels", nil, "--method", "POST", "-f", "name=agent:review", "-f", "color=5319e7"); e != nil { // existing labels are normal; verify rather than suppress unrelated errors
+
+// ensureLabel creates a label; an existing label is normal, so a failed create
+// is verified rather than suppressing unrelated errors.
+func (g GH) ensureLabel(ctx context.Context, p Project, name, color string) error {
+	if e := g.api(ctx, "repos/"+p.Repo+"/labels", nil, "--method", "POST", "-f", "name="+name, "-f", "color="+color); e != nil {
 		var label Label
-		if check := g.api(ctx, "repos/"+p.Repo+"/labels/agent%3Areview", &label); check != nil {
+		if check := g.api(ctx, "repos/"+p.Repo+"/labels/"+url.PathEscape(name), &label); check != nil {
 			return e
 		}
+	}
+	return nil
+}
+func (g GH) MarkReview(ctx context.Context, p Project, n int) error {
+	if e := g.ensureLabel(ctx, p, "agent:review", "5319e7"); e != nil {
+		return e
 	}
 	if e := g.api(ctx, fmt.Sprintf("repos/%s/issues/%d/labels", p.Repo, n), nil, "--method", "POST", "-f", "labels[]=agent:review"); e != nil {
 		return e
@@ -169,36 +179,18 @@ func (g GH) MarkReview(ctx context.Context, p Project, n int) error {
 	}
 	return nil
 }
-func (g GH) MutateIssue(ctx context.Context, p Project, n int, action string, fields map[string]any) (any, error) {
-	path := fmt.Sprintf("repos/%s/issues", p.Repo)
-	method := "PATCH"
-	if action == "create" {
-		method = "POST"
-	} else {
-		path += "/" + strconv.Itoa(n)
-	}
-	args := []string{"--method", method}
-	switch action {
-	case "close":
-		fields = map[string]any{"state": "closed"}
-	case "label":
-		path += "/labels"
-		method = "POST"
-		args = []string{"--method", method}
-	case "create", "edit":
-	default:
-		return nil, fmt.Errorf("unknown issue action")
-	}
-	for k, v := range fields {
-		if xs, ok := v.([]any); ok {
-			for _, x := range xs {
-				args = append(args, "-f", k+"[]="+fmt.Sprint(x))
-			}
-		} else {
-			args = append(args, "-f", k+"="+fmt.Sprint(v))
+
+// Prepare creates the labels Changathi relies on and reports setup problems
+// that would block dispatch, such as a missing WORKFLOW.md on the base branch.
+func (g GH) Prepare(ctx context.Context, p Project) ([]string, error) {
+	for _, l := range []struct{ name, color string }{{"agent:ready", "0e8a16"}, {"agent:review", "5319e7"}, {"supervisor", "1d76db"}} {
+		if e := g.ensureLabel(ctx, p, l.name, l.color); e != nil {
+			return nil, fmt.Errorf("create label %s: %w", l.name, e)
 		}
 	}
-	var out any
-	e := g.api(ctx, path, &out, args...)
-	return out, e
+	var warnings []string
+	if e := g.api(ctx, "repos/"+p.Repo+"/contents/WORKFLOW.md?ref="+url.QueryEscape(p.Base), nil); e != nil {
+		warnings = append(warnings, fmt.Sprintf("WORKFLOW.md not found on %s; add it before dispatching (%v)", p.Base, e))
+	}
+	return warnings, nil
 }

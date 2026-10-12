@@ -72,7 +72,7 @@ func (g *fakeGH) MarkReview(_ context.Context, p core.Project, _ int) error {
 	g.issues[p.ID] = i
 	return nil
 }
-func (g *fakeGH) MutateIssue(context.Context, core.Project, int, string, map[string]any) (any, error) {
+func (g *fakeGH) Prepare(context.Context, core.Project) ([]string, error) {
 	return nil, nil
 }
 

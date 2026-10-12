@@ -181,18 +181,3 @@ func (t *Transcript) Messages(messages []core.Message, attempt string) {
 	sort.SliceStable(t.Items, func(i, j int) bool { return t.Items[i].Created.Before(t.Items[j].Created) })
 	t.rebuild()
 }
-
-func (t *Transcript) Export() string {
-	var b strings.Builder
-	for _, i := range t.Items {
-		fmt.Fprintf(&b, "## %s", i.Kind)
-		if i.Title != "" {
-			fmt.Fprintf(&b, " — %s", i.Title)
-		}
-		if i.Status != "" {
-			fmt.Fprintf(&b, " [%s]", i.Status)
-		}
-		fmt.Fprintf(&b, "\n\n%s\n\n", i.Text)
-	}
-	return b.String()
-}

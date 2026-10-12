@@ -19,21 +19,20 @@ import (
 )
 
 type Request struct {
-	Child         int            `json:"child,omitempty"`
-	PR            int            `json:"pr,omitempty"`
-	AckCompletion bool           `json:"ack_completion,omitempty"`
-	Evidence      string         `json:"evidence,omitempty"`
-	ID            string         `json:"id"`
-	Action        string         `json:"action"`
-	Project       string         `json:"project,omitempty"`
-	Attempt       string         `json:"attempt,omitempty"`
-	Number        int            `json:"number,omitempty"`
-	Text          string         `json:"text,omitempty"`
-	Repo          string         `json:"repo,omitempty"`
-	Auto          bool           `json:"auto,omitempty"`
-	Concurrency   int            `json:"concurrency,omitempty"`
-	Apply         bool           `json:"apply,omitempty"`
-	Fields        map[string]any `json:"fields,omitempty"`
+	Child         int    `json:"child,omitempty"`
+	PR            int    `json:"pr,omitempty"`
+	AckCompletion bool   `json:"ack_completion,omitempty"`
+	Evidence      string `json:"evidence,omitempty"`
+	ID            string `json:"id"`
+	Action        string `json:"action"`
+	Project       string `json:"project,omitempty"`
+	Attempt       string `json:"attempt,omitempty"`
+	Number        int    `json:"number,omitempty"`
+	Text          string `json:"text,omitempty"`
+	Repo          string `json:"repo,omitempty"`
+	Auto          bool   `json:"auto,omitempty"`
+	Concurrency   int    `json:"concurrency,omitempty"`
+	Apply         bool   `json:"apply,omitempty"`
 }
 type Response struct {
 	Data  any    `json:"data,omitempty"`
@@ -217,9 +216,15 @@ func (s *Server) perform(ctx context.Context, r Request) (any, error) {
 		if r.Concurrency > 0 {
 			p.Concurrency = r.Concurrency
 		}
-		err = e.Store.AddProject(p)
+		warnings, err := e.GitHub.Prepare(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		if err = e.Store.AddProject(p); err != nil {
+			return nil, err
+		}
 		e.Wake()
-		return p, err
+		return map[string]any{"project": p, "warnings": warnings}, nil
 	case "project.pause", "project.resume":
 		p, err := e.Store.Project(r.Project)
 		if err != nil {
@@ -300,8 +305,6 @@ func (s *Server) perform(ctx context.Context, r Request) (any, error) {
 			}
 		}
 		return nil, errors.New("no active attempt")
-	case "issue.create", "issue.edit", "issue.close", "issue.label":
-		return e.GitHub.MutateIssue(ctx, p, r.Number, strings.TrimPrefix(r.Action, "issue."), r.Fields)
 	default:
 		return nil, fmt.Errorf("unknown action %q", r.Action)
 	}

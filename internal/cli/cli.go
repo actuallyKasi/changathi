@@ -3,7 +3,6 @@ package cli
 import (
 	"changathi/internal/core"
 	"changathi/internal/service"
-	"changathi/internal/transcript"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,7 +22,6 @@ type app struct {
 	config     core.Config
 	configFile string
 	json       bool
-	plain      bool
 	out        io.Writer
 }
 
@@ -33,7 +31,6 @@ func New() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.config.DataDir, "data-dir", a.config.DataDir, "Daemon state and workspace directory")
 	root.PersistentFlags().StringVar(&a.configFile, "config", "", "Service YAML configuration")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "Machine-readable JSON output")
-	root.PersistentFlags().BoolVar(&a.plain, "plain", false, "Disable colors and styling")
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if a.configFile != "" {
 			b, err := os.ReadFile(a.configFile)
@@ -67,9 +64,9 @@ func New() *cobra.Command {
 		a.config.DataDir = dir
 		return a.config.Validate()
 	}
-	root.AddCommand(a.daemon(), a.project(), a.issue(), a.supervisor(), a.agent(), a.workspace(), &cobra.Command{Use: "usage", Short: "Read reported provider account limits", RunE: func(c *cobra.Command, _ []string) error {
+	root.AddCommand(a.daemon(), a.summary(), a.project(), a.issue(), a.supervisor(), a.agent(), a.workspace(), a.skill(), &cobra.Command{Use: "usage", Short: "Read reported provider account limits", RunE: func(c *cobra.Command, _ []string) error {
 		return a.action(c.Context(), service.Request{Action: "usage"})
-	}}, &cobra.Command{Use: "watch", Short: "Live terminal dashboard (Ctrl-C to quit)", RunE: func(c *cobra.Command, _ []string) error { return a.watch(c.Context()) }}, &cobra.Command{Use: "doctor", Short: "Check local dependencies and authentication", RunE: func(c *cobra.Command, _ []string) error { return a.doctor(c.Context()) }})
+	}}, &cobra.Command{Use: "doctor", Short: "Check local dependencies and authentication", RunE: func(c *cobra.Command, _ []string) error { return a.doctor(c.Context()) }})
 	return root
 }
 func (a *app) client() *Client { return NewClient(a.config.Socket()) }
@@ -129,21 +126,9 @@ func (a *app) project() *cobra.Command {
 		}
 		return w.Flush()
 	}})
-	for _, action := range []string{"show", "pause", "resume"} {
+	for _, action := range []string{"pause", "resume"} {
 		action := action
 		cmd.AddCommand(&cobra.Command{Use: action + " <name>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-			if action == "show" {
-				s, e := a.client().Status(c.Context())
-				if e != nil {
-					return e
-				}
-				for _, p := range s.Projects {
-					if p.Name == args[0] {
-						return a.display(p)
-					}
-				}
-				return fmt.Errorf("unknown project")
-			}
 			return a.action(c.Context(), service.Request{Action: "project." + action, Project: args[0]})
 		}})
 	}
@@ -161,7 +146,7 @@ func reference(ref string) (string, int, error) {
 	return parts[0], n, nil
 }
 func (a *app) issue() *cobra.Command {
-	cmd := &cobra.Command{Use: "issue", Short: "Manage and dispatch GitHub issues"}
+	cmd := &cobra.Command{Use: "issue", Short: "List and dispatch GitHub issues (create and edit issues with gh)"}
 	var project string
 	var all bool
 	list := &cobra.Command{Use: "list", RunE: func(c *cobra.Command, _ []string) error {
@@ -199,7 +184,7 @@ func (a *app) issue() *cobra.Command {
 	list.Flags().StringVar(&project, "project", "", "Project name")
 	list.Flags().BoolVar(&all, "all", false, "All registered projects")
 	cmd.AddCommand(list)
-	for _, action := range []string{"show", "run", "retry", "cancel", "close"} {
+	for _, action := range []string{"show", "run", "retry", "cancel"} {
 		action := action
 		cmd.AddCommand(&cobra.Command{Use: action + " <project>#<number>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 			p, n, e := reference(args[0])
@@ -209,85 +194,39 @@ func (a *app) issue() *cobra.Command {
 			return a.action(c.Context(), service.Request{Action: "issue." + action, Project: p, Number: n})
 		}})
 	}
-	for _, action := range []string{"create", "edit"} {
-		action := action
-		var title, bodyFile, proj string
-		c := &cobra.Command{Use: action, RunE: func(c *cobra.Command, args []string) error {
-			n := 0
-			p := proj
-			if action == "edit" {
-				if len(args) != 1 {
-					return fmt.Errorf("edit requires project#number")
-				}
-				var e error
-				p, n, e = reference(args[0])
-				if e != nil {
-					return e
-				}
-			} else if p == "" {
-				return fmt.Errorf("create requires --project")
-			}
-			fields := map[string]any{}
-			if title != "" {
-				fields["title"] = title
-			}
-			if bodyFile != "" {
-				b, e := os.ReadFile(bodyFile)
-				if e != nil {
-					return e
-				}
-				fields["body"] = string(b)
-			}
-			if action == "create" && title == "" {
-				return fmt.Errorf("create requires --title")
-			}
-			return a.action(c.Context(), service.Request{Action: "issue." + action, Project: p, Number: n, Fields: fields})
-		}}
-		c.Flags().StringVar(&title, "title", "", "Issue title")
-		c.Flags().StringVar(&bodyFile, "body-file", "", "Markdown body file")
-		c.Flags().StringVar(&proj, "project", "", "Project for issue creation")
-		cmd.AddCommand(c)
-	}
-	var label string
-	l := &cobra.Command{Use: "label <project>#<number>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-		p, n, e := reference(args[0])
-		if e != nil {
-			return e
-		}
-		return a.action(c.Context(), service.Request{Action: "issue.label", Project: p, Number: n, Fields: map[string]any{"labels": []string{label}}})
-	}}
-	l.Flags().StringVar(&label, "add", "", "Label to add")
-	_ = l.MarkFlagRequired("add")
-	cmd.AddCommand(l)
 	return cmd
 }
 func (a *app) agent() *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Inspect agents and send messages"}
-	cmd.AddCommand(&cobra.Command{Use: "list", RunE: func(c *cobra.Command, _ []string) error {
+	var filter agentFilter
+	list := &cobra.Command{Use: "list", Short: "Recent agents, newest first", Args: cobra.NoArgs, RunE: func(c *cobra.Command, _ []string) error {
 		s, e := a.client().Status(c.Context())
 		if e != nil {
 			return e
 		}
-		return a.agents(s)
+		return a.agentRows(agentRows(s, filter))
+	}}
+	list.Flags().BoolVar(&filter.active, "active", false, "Only agents that are still working")
+	list.Flags().StringVar(&filter.project, "project", "", "Filter by registered project")
+	list.Flags().IntVar(&filter.limit, "limit", 20, "Maximum agents to show (0 for all)")
+	cmd.AddCommand(list)
+	var full bool
+	show := &cobra.Command{Use: "show <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
+		s, e := a.client().Status(c.Context())
+		if e != nil {
+			return e
+		}
+		for _, v := range s.Agents {
+			if v.ID == args[0] {
+				return a.display(agentDetail(v, full))
+			}
+		}
+		return fmt.Errorf("unknown agent")
+	}}
+	show.Flags().BoolVar(&full, "full", false, "Include the recorded workflow and prompt")
+	cmd.AddCommand(show, &cobra.Command{Use: "stop <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
+		return a.action(c.Context(), service.Request{Action: "agent.stop", Attempt: args[0]})
 	}})
-	for _, action := range []string{"show", "stop"} {
-		action := action
-		cmd.AddCommand(&cobra.Command{Use: action + " <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-			if action == "stop" {
-				return a.action(c.Context(), service.Request{Action: "agent.stop", Attempt: args[0]})
-			}
-			s, e := a.client().Status(c.Context())
-			if e != nil {
-				return e
-			}
-			for _, v := range s.Agents {
-				if v.ID == args[0] {
-					return a.display(v)
-				}
-			}
-			return fmt.Errorf("unknown agent")
-		}})
-	}
 	var text string
 	m := &cobra.Command{Use: "message <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		return a.action(c.Context(), service.Request{Action: "agent.message", Attempt: args[0], Text: text})
@@ -295,36 +234,21 @@ func (a *app) agent() *cobra.Command {
 	m.Flags().StringVar(&text, "text", "", "Message text")
 	_ = m.MarkFlagRequired("text")
 	cmd.AddCommand(m)
-	cmd.AddCommand(&cobra.Command{Use: "view <id>", Short: "Interactive agent transcript", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-		if !a.isInteractive() || a.json {
-			return a.readableLogs(c.Context(), args[0], false, a.json)
-		}
-		return a.interactive(c.Context(), args[0])
-	}})
-	var follow, raw bool
-	l := &cobra.Command{Use: "logs <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-		return a.readableLogs(c.Context(), args[0], follow, raw || a.json)
+	var o logOptions
+	l := &cobra.Command{Use: "logs <id>", Short: "Agent transcript as plain text", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
+		o.raw = o.raw || a.json
+		return a.readableLogs(c.Context(), args[0], o)
 	}}
-	l.Flags().BoolVar(&follow, "follow", false, "Follow agent events")
-	l.Flags().BoolVar(&raw, "raw", false, "Show individual provider events")
+	l.Flags().BoolVar(&o.follow, "follow", false, "Follow agent events")
+	l.Flags().BoolVar(&o.raw, "raw", false, "Show individual provider events")
+	l.Flags().IntVar(&o.tail, "tail", 0, "Show only the last N transcript items")
+	l.Flags().BoolVar(&o.last, "last", false, "Start from the agent's last message")
+	l.Flags().BoolVar(&o.full, "full", false, "Include output of successful tools and diffs")
 	cmd.AddCommand(l)
 	return cmd
 }
 func (a *app) workspace() *cobra.Command {
-	cmd := &cobra.Command{Use: "workspace", Short: "Inspect or clean delivered worktrees"}
-	cmd.AddCommand(&cobra.Command{Use: "list", RunE: func(c *cobra.Command, _ []string) error {
-		s, e := a.client().Status(c.Context())
-		if e != nil {
-			return e
-		}
-		out := []core.Attempt{}
-		for _, v := range s.Agents {
-			if v.Workspace != "" {
-				out = append(out, v)
-			}
-		}
-		return a.workspaces(out)
-	}})
+	cmd := &cobra.Command{Use: "workspace", Short: "Clean delivered worktrees"}
 	var apply bool
 	clean := &cobra.Command{Use: "clean <agent-id>", Short: "Preview cleanup; --apply removes a clean delivered worktree", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		return a.action(c.Context(), service.Request{Action: "workspace.clean", Attempt: args[0], Apply: apply})
@@ -365,54 +289,7 @@ func (a *app) status(s core.Snapshot) error {
 			fmt.Fprintf(a.out, "SUPERVISOR %s#%d: %s — %s\n", names[v.ProjectID], v.Parent.Number, v.State, v.Reason)
 		}
 	}
-	return a.agents(s)
-}
-func (a *app) agents(s core.Snapshot) error {
-	if a.json {
-		return a.print(s.Agents)
-	}
-	names := map[string]string{}
-	for _, p := range s.Projects {
-		names[p.ID] = p.Name
-	}
-	w := tabwriter.NewWriter(a.out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "AGENT\tISSUE\tSUBJECT\tSTATE\tPR\tDETAIL")
-	for _, v := range s.Agents {
-		detail := strings.ReplaceAll(v.Error, "\n", " ")
-		if detail == "" {
-			detail = v.Activity
-		}
-		if len(detail) > 120 {
-			detail = detail[:120] + "…"
-		}
-		subject := strings.Join(strings.Fields(transcript.Clean(v.Issue.Title)), " ")
-		fmt.Fprintf(w, "%s\t%s#%d\t%s\t%s\t%d\t%s\n", v.ID, names[v.ProjectID], v.Issue.Number, subject, v.State, v.PR, detail)
-	}
-	return w.Flush()
-}
-func (a *app) watch(ctx context.Context) error {
-	if a.isInteractive() && !a.json {
-		return a.interactive(ctx, "")
-	}
-	tick := time.NewTicker(2 * time.Second)
-	defer tick.Stop()
-	for {
-		s, e := a.client().Status(ctx)
-		if e != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return e
-		}
-		if e = a.status(s); e != nil {
-			return e
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-tick.C:
-		}
-	}
+	return a.agentRows(agentRows(s, agentFilter{limit: 20}))
 }
 func (a *app) doctor(ctx context.Context) error {
 	results := map[string]string{}

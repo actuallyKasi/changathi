@@ -8,16 +8,15 @@ import (
 	"os"
 	"sort"
 	"time"
-
-	"golang.org/x/term"
 )
 
-func (a *app) isInteractive() bool {
-	f, ok := a.out.(*os.File)
-	return ok && term.IsTerminal(int(f.Fd())) && term.IsTerminal(int(os.Stdin.Fd())) && os.Getenv("TERM") != "dumb"
+type logOptions struct {
+	follow, raw, full, last bool
+	tail                    int
 }
 
-func (a *app) readableLogs(ctx context.Context, id string, follow, raw bool) error {
+func (a *app) readableLogs(ctx context.Context, id string, o logOptions) error {
+	follow, raw := o.follow, o.raw
 	client := a.client()
 	page, err := client.Transcript(ctx, id, 0, 0)
 	if err != nil {
@@ -35,13 +34,10 @@ func (a *app) readableLogs(ctx context.Context, id string, follow, raw bool) err
 		before, more = older.Before, older.HasMore
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].Seq < events[j].Seq })
-	width := 100
-	if f, ok := a.out.(*os.File); ok {
-		if w, _, e := term.GetSize(int(f.Fd())); e == nil {
-			width = w
-		}
+	if raw && o.tail > 0 && len(events) > o.tail {
+		events = events[len(events)-o.tail:]
 	}
-	renderer := transcript.NewRenderer(width, a.plain || !a.isInteractive() || os.Getenv("NO_COLOR") != "", true)
+	renderer := transcript.Renderer{Full: o.full}
 	t := transcript.Transcript{}
 	printed := map[string]bool{}
 	write := func(es []core.Event, initial bool) error {
@@ -66,12 +62,29 @@ func (a *app) readableLogs(ctx context.Context, id string, follow, raw bool) err
 			if s, e := client.Status(ctx); e == nil {
 				t.Messages(s.Messages, id)
 			}
+			// --last and --tail skip everything before the requested window.
+			skip := 0
+			if o.tail > 0 {
+				skip = len(t.Items) - o.tail
+			}
+			if o.last {
+				skip = len(t.Items)
+				for n := len(t.Items) - 1; n >= 0; n-- {
+					if t.Items[n].Kind == "assistant" {
+						skip = n
+						break
+					}
+				}
+			}
+			for n := 0; n < skip && n < len(t.Items); n++ {
+				printed[t.Items[n].Key] = true
+			}
 		}
 		for _, i := range t.Items {
 			if printed[i.Key] || (!i.Complete && follow) {
 				continue
 			}
-			if _, err := fmt.Fprint(a.out, renderer.Render(i, true, false)); err != nil {
+			if _, err := fmt.Fprint(a.out, renderer.Render(i)); err != nil {
 				return err
 			}
 			printed[i.Key] = true
@@ -86,7 +99,7 @@ func (a *app) readableLogs(ctx context.Context, id string, follow, raw bool) err
 		}
 		return nil
 	}
-	if page.Gap || more {
+	if (page.Gap || more) && o.tail == 0 && !o.last {
 		if a.json {
 			fmt.Fprintln(os.Stderr, "[Earlier history is incomplete or outside the viewer limit]")
 		} else {
