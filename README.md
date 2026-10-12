@@ -111,27 +111,36 @@ From here, ask Claude how things are going. It uses `summary`, `agent logs` and 
 
 ```mermaid
 flowchart TB
-    you(["You"]) --> claude["Claude + changathi skill"]
-    claude -- "changathi CLI" --> api
-    claude -- "gh issue create / edit" --> gh[("GitHub")]
+    claude(["Claude + changathi skill"])
 
     subgraph daemon["changathi daemon"]
-        api["Local API<br/>unix socket, HTTP /v1"] --> sched["Scheduler<br/>claims, fairness, retries"]
-        sched --> sup["Supervisor<br/>dependent issues"]
-        sched --> ws["Workspace manager<br/>clones + worktrees"]
-        sched --> runner["Agent runner"]
-        runner --> deliver["Delivery controller<br/>validate, PR, merge"]
-        store[("SQLite state<br/>events, logs")]
+        api["Local API<br/>(Unix socket)"]
+        sched["Scheduler<br/>+ supervisor"]
+        store[("SQLite state")]
+        ws["Workspace<br/>manager"]
+        runner["Agent runner"]
+        deliver["Delivery<br/>controller"]
+        api --> sched
+        sched --- store
+        sched --> ws
+        sched --> runner
+        runner --> deliver
     end
 
-    sched -- "poll agent:ready" --> gh
-    deliver -- "push, PR, checks, merge" --> gh
-    runner -- "stdio" --> codex["codex app-server<br/>one per attempt"]
-    codex -- "edits + commits" --> wt["worktree"]
-    ws --> wt
-```
+    subgraph issue["per issue"]
+        codex["codex app-server"]
+        wt["worktree"]
+        codex -- "commits" --> wt
+    end
 
-All daemon components read and write the SQLite state store.
+    gh[("GitHub")]
+
+    claude -- "changathi CLI" --> api
+    ws --> wt
+    runner -- "stdio" --> codex
+    sched -- "poll issues" --> gh
+    deliver -- "PR, checks, merge" --> gh
+```
 
 - **Local API.** Versioned HTTP over `<data_dir>/daemon.sock`, readable only by your user. The CLI is a thin client; quitting it never stops agents.
 - **Scheduler.** Polls GitHub every 30 seconds, round-robins between projects, and enforces global and per-project concurrency (both default to 1). Retry, CI and account-limit waits don't hold a slot.
@@ -145,7 +154,6 @@ All daemon components read and write the SQLite state store.
 
 ```mermaid
 stateDiagram-v2
-    direction LR
     [*] --> queued: ready label or issue run
     queued --> preparing: slot free
     preparing --> running: worktree ready
