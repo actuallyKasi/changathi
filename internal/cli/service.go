@@ -189,14 +189,19 @@ func (a *app) serviceUnit(c *cobra.Command, logDir string) (serviceUnit, error) 
 		return serviceUnit{}, err
 	}
 	dirs := []string{filepath.Dir(bin)}
-	for _, tool := range []string{"git", "gh", a.config.Codex} {
+	tools := []string{"git", "gh"}
+	executables := map[string]string{"codex": a.config.Codex, "claude": a.config.Claude}
+	for _, name := range a.enabledProviders() {
+		tools = append(tools, executables[name])
+	}
+	for _, tool := range tools {
 		p, err := exec.LookPath(tool)
 		if err != nil {
 			return serviceUnit{}, fmt.Errorf("%s not found on PATH; install it or run `changathi doctor`", tool)
 		}
 		dirs = append(dirs, filepath.Dir(p))
 	}
-	// The npm build of codex is a node script.
+	// npm builds of codex and claude are node scripts.
 	if p, err := exec.LookPath("node"); err == nil {
 		dirs = append(dirs, filepath.Dir(p))
 	}

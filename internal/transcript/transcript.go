@@ -6,7 +6,6 @@ import (
 	"changathi/internal/provider"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -158,26 +157,4 @@ func (t *Transcript) Apply(e core.Event) {
 		}
 	}
 	t.put(i)
-}
-
-func (t *Transcript) Messages(messages []core.Message, attempt string) {
-	for _, m := range messages {
-		if m.AttemptID != attempt {
-			continue
-		}
-		key := "operator:" + m.ID
-		text := bounded(Clean(m.Text))
-		if m.Error != "" {
-			text += "\n" + bounded(Clean(m.Error))
-		}
-		if t.index == nil {
-			t.rebuild()
-		}
-		if n, ok := t.index[key]; ok && t.Items[n].Status == m.State && t.Items[n].Text == text {
-			continue
-		}
-		t.put(Item{Key: key, Kind: "operator", Title: "You", Text: text, Status: Clean(m.State), Created: m.Created, Complete: true})
-	}
-	sort.SliceStable(t.Items, func(i, j int) bool { return t.Items[i].Created.Before(t.Items[j].Created) })
-	t.rebuild()
 }

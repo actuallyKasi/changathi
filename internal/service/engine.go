@@ -15,27 +15,27 @@ import (
 )
 
 type worker struct {
-	cancel     context.CancelFunc
-	session    provider.Session
-	activeTurn bool
+	cancel context.CancelFunc
 }
 type Engine struct {
 	supervisorMu sync.Mutex
 	Config       core.Config
 	Store        *core.Store
 	GitHub       core.GitHub
-	Provider     provider.Provider
+	Providers    map[string]provider.Provider
 	Workspaces   core.Workspaces
+	usageMu      sync.Mutex
 	mu           sync.Mutex
 	workers      map[string]*worker
 	locks        map[string]*sync.Mutex
 	cursor       int
+	login        string // operator login shown in status comments
 	wake         chan struct{}
 	wg           sync.WaitGroup
 }
 
-func New(c core.Config, s *core.Store, gh core.GitHub, p provider.Provider) *Engine {
-	return &Engine{Config: c, Store: s, GitHub: gh, Provider: p, Workspaces: core.Workspaces{Root: c.DataDir}, workers: map[string]*worker{}, locks: map[string]*sync.Mutex{}, wake: make(chan struct{}, 1)}
+func New(c core.Config, s *core.Store, gh core.GitHub, providers map[string]provider.Provider) *Engine {
+	return &Engine{Config: c, Store: s, GitHub: gh, Providers: providers, Workspaces: core.Workspaces{Root: c.DataDir}, workers: map[string]*worker{}, locks: map[string]*sync.Mutex{}, wake: make(chan struct{}, 1)}
 }
 func (e *Engine) Wake() {
 	select {
@@ -110,7 +110,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	for _, a := range as {
 		switch a.State {
-		case "preparing", "running", "validating", "pr_open", "merging": // preserve workspace and reconcile PR before any replacement execution
+		case "preparing", "running", "validating", "verifying", "pr_open", "merging": // preserve workspace and reconcile PR before any replacement execution
 			guard, lockErr := core.ExecutionLock(e.Config.DataDir, a.ID)
 			if lockErr != nil {
 				e.state(a.ID, "needs_attention", lockErr.Error())
@@ -119,14 +119,6 @@ func (e *Engine) Run(ctx context.Context) error {
 			guard.Close()
 			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.PID = 0; return nil })
 			e.state(a.ID, "retry_wait", "recovering interrupted operation")
-		}
-	}
-	messages, _ := core.List[core.Message](e.Store, "message")
-	for _, m := range messages {
-		if m.State == "sent" {
-			m.State = "uncertain"
-			m.Error = "daemon interrupted delivery"
-			_ = e.Store.Put("message", m.ID, m)
 		}
 	}
 	ticker := time.NewTicker(time.Duration(e.Config.PollSeconds) * time.Second)
@@ -164,8 +156,11 @@ func (e *Engine) poll(ctx context.Context) {
 		if p.Enabled && p.Error != "" {
 			lock := e.lock(p.ID)
 			lock.Lock()
-			_, flowErr := e.Workspaces.LoadWorkflow(ctx, p)
+			flow, flowErr := e.Workspaces.LoadWorkflow(ctx, p)
 			lock.Unlock()
+			if flowErr == nil {
+				flowErr = e.checkWorkflow(flow)
+			}
 			if flowErr == nil {
 				_ = e.Store.UpdateProject(p.ID, func(x *core.Project) error { x.Error = ""; return nil })
 				as, _ := core.List[core.Attempt](e.Store, "attempt")
@@ -175,6 +170,9 @@ func (e *Engine) poll(ctx context.Context) {
 					}
 				}
 			}
+		}
+		if p.Enabled {
+			e.pollRework(ctx, p)
 		}
 		if p.Enabled && p.Auto {
 			xs, err := e.GitHub.Issues(ctx, p, true)
@@ -216,12 +214,9 @@ func (e *Engine) poll(ctx context.Context) {
 			}
 		}
 	}
+	e.publishStatus(ctx)
 }
 func (e *Engine) dispatch(ctx context.Context) {
-	var gate core.ProviderGate
-	if e.Store.Get("gate", "codex", &gate) == nil && gate.Until.After(core.Now()) {
-		return
-	}
 	ps, err := core.List[core.Project](e.Store, "project")
 	if err != nil || len(ps) == 0 {
 		return
@@ -249,6 +244,9 @@ func (e *Engine) dispatch(ctx context.Context) {
 		lock.Lock()
 		flow, loadErr := e.Workspaces.LoadWorkflow(ctx, p)
 		lock.Unlock()
+		if loadErr == nil {
+			loadErr = e.checkWorkflow(flow)
+		}
 		if loadErr != nil {
 			_ = e.Store.UpdateProject(p.ID, func(x *core.Project) error { x.Error = loadErr.Error(); return nil })
 			_ = e.Store.Event("", "workflow_error", p.Name+": "+loadErr.Error())
@@ -279,6 +277,10 @@ func (e *Engine) dispatch(ctx context.Context) {
 				if err := e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Workflow = flow; return nil }); err != nil {
 					continue
 				}
+			}
+			// Account gates apply per provider; delivery-only waits need no agent session.
+			if a.State != "waiting_checks" && e.gate(a.Workflow.Implementer()) != nil {
+				continue
 			}
 			if a.SupervisorID != "" {
 				if err := e.eligible(ctx, p, a); err != nil {
@@ -355,53 +357,6 @@ func (e *Engine) Cancel(id string) error {
 	e.Wake()
 	return nil
 }
-func (e *Engine) Message(ctx context.Context, id, text string) (core.Message, error) {
-	a, err := e.current(id)
-	if err != nil {
-		return core.Message{}, err
-	}
-	if !a.Active() {
-		return core.Message{}, errors.New("agent is not active")
-	}
-	if a.State == "validating" || a.State == "merging" || a.State == "pr_open" {
-		return core.Message{}, errors.New("agent has finished its turn and delivery is in progress; use issue retry after delivery for rework")
-	}
-	if strings.TrimSpace(text) == "" {
-		return core.Message{}, errors.New("message text is empty")
-	}
-	m := core.Message{ID: core.ID(), AttemptID: id, Text: text, State: "queued", Created: core.Now()}
-	if err = e.Store.Put("message", m.ID, m); err != nil {
-		return m, err
-	}
-	e.mu.Lock()
-	w := e.workers[id]
-	var s provider.Session
-	if w != nil && w.activeTurn {
-		s = w.session
-	}
-	e.mu.Unlock()
-	if s != nil {
-		m.State = "sent"
-		if err = e.Store.Put("message", m.ID, m); err != nil {
-			return m, err
-		}
-		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = s.Steer(callCtx, text, m.ID)
-		cancel()
-		if err != nil {
-			m.State = "uncertain"
-			m.Error = err.Error()
-		} else {
-			m.State = "acknowledged"
-		}
-		err = e.Store.Put("message", m.ID, m)
-	} else if a.State == "waiting_checks" {
-		e.state(id, "queued", "operator message queued")
-		_ = e.Store.UpdateAttempt(id, func(x *core.Attempt) error { x.Due = time.Time{}; return nil })
-		e.Wake()
-	}
-	return m, err
-}
 func (e *Engine) fail(ctx context.Context, id string, err error) {
 	a, _ := e.current(id)
 	if a.State == "cancelled" {
@@ -418,7 +373,12 @@ func (e *Engine) fail(ctx context.Context, id string, err error) {
 	msg := err.Error()
 	if strings.Contains(strings.ToLower(msg), "rate limit") || strings.Contains(strings.ToLower(msg), "usage limit") || strings.Contains(strings.ToLower(msg), "ratelimit") || strings.Contains(strings.ToLower(msg), "quota") {
 		until := core.Now().Add(5 * time.Minute)
-		_ = e.Store.Put("gate", "codex", core.ProviderGate{Until: until, Reason: msg})
+		role := core.Role{Provider: "codex"}
+		var re roleError
+		if errors.As(err, &re) {
+			role = re.role
+		}
+		e.setGate(role, msg, until)
 		e.state(id, "waiting_account", msg)
 		_ = e.Store.UpdateAttempt(id, func(a *core.Attempt) error { a.Due = until; return nil })
 		return
@@ -502,116 +462,176 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 		e.deliver(ctx, p, a, pr)
 		return
 	}
-	prompt, err := flow.Render(a.Issue)
+	// Rework stores the operator's comments just after enqueueing, so read them fresh.
+	if cur, err := e.current(a.ID); err == nil {
+		a.Feedback = cur.Feedback
+	}
+	issuePrompt, err := implementPrompt(p, a, flow)
 	if err != nil {
 		e.fail(ctx, a.ID, err)
 		return
 	}
-	prompt = fmt.Sprintf("Work on GitHub issue #%d in %s.\nTitle: %s\nDescription:\n%s\n\n%s\n\nImplement changes and commit them on the existing branch. Do not push, create/merge PRs, close issues, or use closing keywords in commits. Changathi handles delivery after validating your changes. Leave the issue open for human review. Run the configured validation commands: %v.", a.Issue.Number, p.Repo, a.Issue.Title, a.Issue.Body, prompt, flow.Validation)
-	if a.Error != "" {
-		prompt += "\nPrevious attempt/check outcome: " + a.Error
-	}
-	s, err := e.Provider.Open(ctx)
+	impl := flow.Implementer()
+	prov, err := e.provider(impl)
 	if err != nil {
-		e.fail(ctx, a.ID, err)
+		e.state(a.ID, "needs_attention", err.Error())
 		return
 	}
-	if proc, ok := s.(interface{ ProcessID() int }); ok {
-		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.PID = proc.ProcessID(); return nil })
+	// A thread belongs to the provider that created it; legacy records are Codex threads.
+	thread, owner := a.Thread, a.ThreadProvider
+	if owner == "" {
+		owner = "codex"
 	}
+	if owner != impl.Provider {
+		thread = ""
+	}
+	// The implement session opens only when a turn actually runs, so resuming at
+	// validation or verification never starts (or bills) the implementer.
+	var s provider.Session
 	defer func() {
-		_ = s.Close()
+		if s != nil {
+			_ = s.Close()
+		}
 		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.PID = 0; return nil })
 	}()
-	if err = s.Start(ctx, provider.Request{Workspace: path, Thread: a.Thread, Model: flow.Model}); err != nil {
-		e.fail(ctx, a.ID, err)
-		return
-	}
-	e.mu.Lock()
-	if w := e.workers[a.ID]; w != nil {
-		w.session = s
-	}
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		if w := e.workers[a.ID]; w != nil {
-			w.session = nil
+	open := func(thread string) error {
+		if s != nil {
+			_ = s.Close()
+			s = nil
 		}
-		e.mu.Unlock()
-	}()
-	threadID := a.Thread
-	for turns := a.Turns; turns < flow.MaxTurns; turns++ {
+		session, err := prov.Open(ctx)
+		if err != nil {
+			return err
+		}
+		s = session
+		if proc, ok := s.(interface{ ProcessID() int }); ok {
+			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.PID = proc.ProcessID(); return nil })
+		}
+		if err = s.Start(ctx, provider.Request{Workspace: path, Thread: thread, Model: impl.Model, Effort: impl.Effort}); err != nil {
+			return err
+		}
+		e.event(a.ID, "role", strings.TrimSpace(fmt.Sprintf("implement %s %s", impl.Provider, impl.Model)))
+		return nil
+	}
+	setStep := func(step, failure string) {
+		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error {
+			x.NextStep = step
+			if failure != "" {
+				x.LastFailure = failure
+			}
+			return nil
+		})
+	}
+	prompt := issuePrompt
+	resume := a.NextStep == "validate"
+	if resume {
+		e.event(a.ID, "resume", "implement turn already completed; resuming at validation")
+	}
+	threadID := thread
+	for turns := a.Turns; turns < flow.MaxTurns || resume; turns++ {
 		if err = e.eligible(ctx, p, a); err != nil {
 			e.fail(ctx, a.ID, err)
 			return
 		}
-		messages, _ := core.List[core.Message](e.Store, "message")
-		for _, m := range messages {
-			if m.AttemptID == a.ID && m.State == "queued" {
-				prompt += "\nOperator message [" + m.ID + "]: " + m.Text
-				m.State = "sent"
-				_ = e.Store.Put("message", m.ID, m)
-			}
-		}
-		e.state(a.ID, "running", "")
-		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Turns = turns + 1; return nil })
-		err = s.Run(ctx, prompt, func(v provider.Event) {
-			if v.Thread != "" {
-				threadID = v.Thread
-				e.mu.Lock()
-				if w := e.workers[a.ID]; w != nil {
-					w.activeTurn = true
+		if resume {
+			resume = false
+			turns-- // no agent turn consumed
+		} else {
+			if s == nil {
+				if g := e.gate(impl); g != nil {
+					e.state(a.ID, "waiting_account", g.Reason)
+					_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Due = g.Until; return nil })
+					return
 				}
-				e.mu.Unlock()
-				_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Thread = v.Thread; x.Turn = v.Turn; x.PID = v.PID; return nil })
-				for _, m := range messages {
-					if m.AttemptID == a.ID && m.State == "queued" {
-						m.State = "acknowledged"
-						_ = e.Store.Put("message", m.ID, m)
+				if err = open(thread); err != nil {
+					e.fail(ctx, a.ID, roleError{impl, err})
+					return
+				}
+			}
+			e.state(a.ID, "running", "")
+			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Turns = turns + 1; x.NextStep = ""; return nil })
+			run := func(prompt string) error {
+				return s.Run(ctx, prompt, func(v provider.Event) {
+					if v.Thread != "" {
+						threadID = v.Thread
+						_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error {
+							x.Thread, x.ThreadProvider, x.Turn = v.Thread, impl.Provider, v.Turn
+							if v.PID != 0 {
+								x.PID = v.PID
+							}
+							return nil
+						})
 					}
+					e.recordEvent(core.Event{Version: 1, ProjectID: p.ID, AttemptID: a.ID, ThreadID: threadID, TurnID: v.Turn, Type: v.Type, Text: v.Text, Output: v.Output})
+				})
+			}
+			err = run(prompt)
+			if errors.Is(err, provider.ErrSessionLost) {
+				// Start over in a fresh session, telling it what the branch already holds.
+				e.event(a.ID, "session_lost", err.Error()+"; continuing in a new session")
+				thread, threadID = "", ""
+				_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Thread = ""; return nil })
+				if err = open(""); err == nil {
+					err = run(e.recoveryPrompt(ctx, p, path, issuePrompt, prompt))
 				}
 			}
-			e.recordEvent(core.Event{Version: 1, ProjectID: p.ID, AttemptID: a.ID, ThreadID: threadID, TurnID: v.Turn, Type: v.Type, Text: v.Text, Output: v.Output})
-		})
-		e.mu.Lock()
-		if w := e.workers[a.ID]; w != nil {
-			w.activeTurn = false
-		}
-		e.mu.Unlock()
-		if err != nil {
-			for _, m := range messages {
-				if m.AttemptID == a.ID && m.State == "queued" {
-					var latest core.Message
-					if e.Store.Get("message", m.ID, &latest) == nil && latest.State == "sent" {
-						latest.State = "uncertain"
-						latest.Error = err.Error()
-						_ = e.Store.Put("message", latest.ID, latest)
-					}
-				}
+			if err != nil {
+				e.fail(ctx, a.ID, roleError{impl, err})
+				return
 			}
-			e.fail(ctx, a.ID, err)
-			return
-		}
-		pending, _ := core.List[core.Message](e.Store, "message")
-		hasQueued := false
-		for _, m := range pending {
-			if m.AttemptID == a.ID && m.State == "queued" {
-				hasQueued = true
-			}
-		}
-		if hasQueued {
-			prompt = "Address the queued operator instructions and commit your changes."
-			continue
+			// The turn is complete: an interruption from here on resumes at validation.
+			setStep("validate", "")
 		}
 		e.state(a.ID, "validating", "")
 		head, base, validationErr := e.validate(ctx, p, a)
 		if validationErr != nil {
 			prompt = "Validation failed. Fix the problem and commit the correction:\n" + validationErr.Error()
+			setStep("", prompt)
 			continue
+		}
+		if verifier := flow.Verifier(); verifier != nil {
+			latest, _ := e.current(a.ID)
+			if v := latestVerification(latest, head); v != nil && v.Verdict == "pass" {
+				e.event(a.ID, "verification", "pass already recorded for "+shortSHA(head)+"; not re-verifying")
+			} else {
+				if g := e.gate(*verifier); g != nil {
+					e.state(a.ID, "waiting_account", g.Reason)
+					_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Due = g.Until; return nil })
+					return
+				}
+				e.state(a.ID, "verifying", "")
+				rec, verifyErr := e.verify(ctx, p, a, *verifier, head, base)
+				if errors.Is(verifyErr, errWorktreeChanged) {
+					e.state(a.ID, "needs_attention", verifyErr.Error())
+					return
+				}
+				if verifyErr != nil {
+					e.fail(ctx, a.ID, verifyErr)
+					return
+				}
+				switch rec.Verdict {
+				case "malformed":
+					e.state(a.ID, "needs_attention", "verifier returned no valid verdict twice: "+rec.Error)
+					return
+				case "fail":
+					latest, _ := e.current(a.ID)
+					blocking := core.FindingsText(rec.Findings, "blocking")
+					prompt = "An independent reviewer found blocking problems in your change. Fix them and commit the corrections:\n" + blocking
+					setStep("", prompt)
+					if latest.VerifyFailures >= flow.VerifyRounds() {
+						e.state(a.ID, "needs_attention", fmt.Sprintf("verification failed %d times; latest blocking findings:\n%s", latest.VerifyFailures, blocking))
+						return
+					}
+					continue
+				}
+			}
+		}
+		if latest, err := e.current(a.ID); err == nil {
+			a.Verifications = latest.Verifications
 		}
 		a.Head = head
 		a.BaseSHA = base
-		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Head = head; x.BaseSHA = base; return nil })
+		_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Head = head; x.BaseSHA = base; x.LastFailure = ""; return nil })
 		if err = e.eligible(ctx, p, a); err != nil {
 			e.fail(ctx, a.ID, err)
 			return
@@ -632,10 +652,68 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 			e.fail(ctx, a.ID, errors.New("PR creation returned no PR"))
 			return
 		}
+		e.postVerificationNotes(ctx, p, a, pr)
 		e.deliver(ctx, p, a, pr)
 		return
 	}
-	e.fail(ctx, a.ID, errors.New("validation failed after maximum agent turns"))
+	e.fail(ctx, a.ID, errors.New("validation or verification failed after maximum agent turns"))
+}
+
+// implementPrompt is the full first-turn prompt: the issue, delivery rules, the
+// previous generation's outcome for rework, the operator's review comments, and
+// the last failure to address.
+func implementPrompt(p core.Project, a core.Attempt, flow core.Workflow) (string, error) {
+	body, err := flow.Render(a.Issue)
+	if err != nil {
+		return "", err
+	}
+	prompt := fmt.Sprintf("Work on GitHub issue #%d in %s.\nTitle: %s\nDescription:\n%s\n\n%s\n\nImplement changes and commit them on the existing branch. Do not push, create/merge PRs, close issues, or use closing keywords in commits. Changathi handles delivery after validating your changes. Leave the issue open for human review. Run the configured validation commands: %v.", a.Issue.Number, p.Repo, a.Issue.Title, a.Issue.Body, body, flow.Validation)
+	if prev := a.Previous; prev != nil {
+		prompt += fmt.Sprintf("\n\nThis is rework: generation %d of this issue came before you.", prev.Generation)
+		switch {
+		case prev.PR != 0 && (prev.State == "awaiting_review" || prev.State == "done" || prev.State == "superseded"):
+			prompt += fmt.Sprintf(" Its PR #%d was merged, so that work is already on your branch. Change only what the issue still needs.", prev.PR)
+		case prev.PR != 0:
+			prompt += fmt.Sprintf(" Its PR #%d was not merged (it ended %s).", prev.PR, prev.State)
+		default:
+			prompt += fmt.Sprintf(" It ended %s without a PR.", prev.State)
+		}
+		if prev.LastFailure != "" {
+			prompt += "\nIts last failure:\n" + prev.LastFailure
+		}
+	}
+	if a.Feedback != "" {
+		prompt += "\n\n" + a.Feedback
+	}
+	if a.LastFailure != "" {
+		prompt += "\n\nThe last failure on this branch, still to be fixed:\n" + a.LastFailure
+	}
+	return prompt, nil
+}
+
+// recoveryPrompt rebuilds context for a fresh session after a lost one: the
+// issue, what the branch already holds, and the turn's own instruction.
+func (e *Engine) recoveryPrompt(ctx context.Context, p core.Project, path, issuePrompt, turnPrompt string) string {
+	var b strings.Builder
+	b.WriteString("Your earlier session for this issue could not be resumed, so you are starting without its history. Continue the work already on this branch rather than starting over.\n")
+	for _, part := range []struct{ title, cmd string }{
+		{"Commits on the branch", "log --oneline origin/" + p.Base + "..HEAD"},
+		{"Changed files", "diff --stat origin/" + p.Base + "...HEAD"},
+		{"Uncommitted changes", "status --porcelain"},
+	} {
+		out, err := core.Command(ctx, path, "git", strings.Fields(part.cmd)...)
+		if err != nil || strings.TrimSpace(out) == "" {
+			out = "(none)"
+		}
+		fmt.Fprintf(&b, "\n%s:\n%s\n", part.title, out)
+	}
+	b.WriteString("\n")
+	b.WriteString(issuePrompt)
+	if turnPrompt != issuePrompt {
+		b.WriteString("\n\nCurrent task:\n")
+		b.WriteString(turnPrompt)
+	}
+	return b.String()
 }
 func (e *Engine) event(id, typ, text string) {
 	e.recordEvent(core.Event{AttemptID: id, Type: typ, Text: text})
@@ -643,6 +721,12 @@ func (e *Engine) event(id, typ, text string) {
 func (e *Engine) recordEvent(event core.Event) {
 	id, typ, text := event.AttemptID, event.Type, event.Text
 	activity := typ
+	if event.Output != nil && event.Output.Kind == "assistant" && event.Output.Mode == "snapshot" && text != "" {
+		activity = strings.ReplaceAll(text, "\n", " ")
+		if len(activity) > 160 {
+			activity = activity[:160]
+		}
+	}
 	if typ == "item/agentMessage/delta" && text != "" {
 		activity = strings.ReplaceAll(text, "\n", " ")
 		if len(activity) > 160 {
@@ -650,6 +734,9 @@ func (e *Engine) recordEvent(event core.Event) {
 		}
 	}
 	_ = e.Store.UpdateAttempt(id, func(a *core.Attempt) error { a.Activity = activity; return nil })
+	if typ == "claude/usage" || typ == "claude/rate_limit" {
+		e.recordUsage(typ, text)
+	}
 	if typ == "account/rateLimits/updated" {
 		_ = e.Store.Put("usage", "codex", map[string]any{"reported": text})
 	}
@@ -783,6 +870,7 @@ func (e *Engine) deliver(ctx context.Context, p core.Project, a core.Attempt, pr
 	decision, err := CheckPR(p, a, pr)
 	if err != nil {
 		if strings.Contains(err.Error(), "check ") && a.Turns < a.Workflow.MaxTurns {
+			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.LastFailure = err.Error(); x.NextStep = ""; return nil })
 			e.state(a.ID, "queued", err.Error())
 			return
 		}

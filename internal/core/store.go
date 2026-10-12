@@ -210,6 +210,8 @@ func (s *Store) enqueueLocked(p Project, i Issue, trigger string, retry bool, su
 			latest.PlanRevision = revision
 			latest.Retries = 0
 			latest.Turns = 0
+			latest.VerifyFailures = 0
+			latest.NextStep = ""
 			latest.PID = 0
 			latest.ReadyRemoved = false
 			latest.Due = time.Time{}
@@ -218,6 +220,13 @@ func (s *Store) enqueueLocked(p Project, i Issue, trigger string, retry bool, su
 		}
 	}
 	a := Attempt{SupervisorID: supervisor, PlanRevision: revision, ID: ID(), ProjectID: p.ID, Issue: i, Generation: g + 1, Trigger: trigger, State: "queued", Created: Now(), Updated: Now()}
+	if latest != nil {
+		failure := latest.LastFailure
+		if failure == "" && strings.Contains(latest.Error, "closed without merging") {
+			failure = latest.Error
+		}
+		a.Previous = &PreviousGeneration{Generation: latest.Generation, PR: latest.PR, State: latest.State, LastFailure: failure}
+	}
 	a.Branch = fmt.Sprintf("changathi/%s/%d/g%d", p.ID[:8], i.Number, a.Generation)
 	if err := s.put("attempt", a.ID, a); err != nil {
 		return a, err
@@ -290,11 +299,27 @@ func (s *Store) Snapshot() (Snapshot, error) {
 	if e != nil {
 		return v, e
 	}
-	v.Messages, e = List[Message](s, "message")
-	_ = s.Get("usage", "codex", &v.Usage)
-	var gate ProviderGate
-	if s.Get("gate", "codex", &gate) == nil && gate.Until.After(Now()) {
-		v.ProviderWait = &gate
+	for _, name := range Providers {
+		var usage any
+		if s.Get("usage", name, &usage) == nil && usage != nil {
+			if v.Usage == nil {
+				v.Usage = map[string]any{}
+			}
+			v.Usage[name] = usage
+		}
+	}
+	gates, _ := List[ProviderGate](s, "gate")
+	for _, gate := range gates {
+		if gate.Until.After(Now()) {
+			if gate.Provider == "" {
+				gate.Provider = "codex"
+			}
+			v.ProviderWaits = append(v.ProviderWaits, gate)
+			if v.ProviderWait == nil || gate.Until.Before(v.ProviderWait.Until) {
+				g := gate
+				v.ProviderWait = &g
+			}
+		}
 	}
 	return v, e
 }

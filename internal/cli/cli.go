@@ -2,6 +2,7 @@ package cli
 
 import (
 	"changathi/internal/core"
+	"changathi/internal/provider"
 	"changathi/internal/service"
 	"context"
 	"encoding/json"
@@ -39,7 +40,7 @@ func New() *cobra.Command {
 				return err
 			}
 			oldDir := a.config.DataDir
-			oldConcurrency, oldPoll, oldCodex := a.config.Concurrency, a.config.PollSeconds, a.config.Codex
+			oldConcurrency, oldPoll, oldCodex, oldClaude := a.config.Concurrency, a.config.PollSeconds, a.config.Codex, a.config.Claude
 			decoder := yaml.NewDecoder(strings.NewReader(string(b)))
 			decoder.KnownFields(true)
 			if err = decoder.Decode(&a.config); err != nil {
@@ -57,6 +58,9 @@ func New() *cobra.Command {
 			if cmd.Flags().Changed("codex") {
 				a.config.Codex = oldCodex
 			}
+			if cmd.Flags().Changed("claude") {
+				a.config.Claude = oldClaude
+			}
 		}
 		dir, err := filepath.Abs(a.config.DataDir)
 		if err != nil {
@@ -67,7 +71,7 @@ func New() *cobra.Command {
 	}
 	root.AddCommand(a.daemon(), a.summary(), a.project(), a.issue(), a.supervisor(), a.agent(), a.workspace(), a.skill(), &cobra.Command{Use: "usage", Short: "Read reported provider account limits", RunE: func(c *cobra.Command, _ []string) error {
 		return a.action(c.Context(), service.Request{Action: "usage"})
-	}}, &cobra.Command{Use: "doctor", Short: "Check local dependencies and authentication", RunE: func(c *cobra.Command, _ []string) error { return a.doctor(c.Context()) }})
+	}}, a.doctorCommand())
 	return root
 }
 func (a *app) client() *Client { return NewClient(a.config.Socket()) }
@@ -89,6 +93,7 @@ func (a *app) daemon() *cobra.Command {
 	start.Flags().IntVar(&a.config.Concurrency, "concurrency", 1, "Global agent limit")
 	start.Flags().IntVar(&a.config.PollSeconds, "poll-seconds", 30, "GitHub poll interval")
 	start.Flags().StringVar(&a.config.Codex, "codex", "codex", "Codex executable")
+	start.Flags().StringVar(&a.config.Claude, "claude", "claude", "Claude Code executable")
 	cmd.AddCommand(start, a.daemonInstall(), a.daemonUninstall(), &cobra.Command{Use: "status", RunE: func(c *cobra.Command, _ []string) error {
 		s, e := a.client().Status(c.Context())
 		if e != nil {
@@ -198,7 +203,7 @@ func (a *app) issue() *cobra.Command {
 	return cmd
 }
 func (a *app) agent() *cobra.Command {
-	cmd := &cobra.Command{Use: "agent", Short: "Inspect agents and send messages"}
+	cmd := &cobra.Command{Use: "agent", Short: "Inspect and stop agents"}
 	var filter agentFilter
 	list := &cobra.Command{Use: "list", Short: "Recent agents, newest first", Args: cobra.NoArgs, RunE: func(c *cobra.Command, _ []string) error {
 		s, e := a.client().Status(c.Context())
@@ -228,13 +233,6 @@ func (a *app) agent() *cobra.Command {
 	cmd.AddCommand(show, &cobra.Command{Use: "stop <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		return a.action(c.Context(), service.Request{Action: "agent.stop", Attempt: args[0]})
 	}})
-	var text string
-	m := &cobra.Command{Use: "message <id>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
-		return a.action(c.Context(), service.Request{Action: "agent.message", Attempt: args[0], Text: text})
-	}}
-	m.Flags().StringVar(&text, "text", "", "Message text")
-	_ = m.MarkFlagRequired("text")
-	cmd.AddCommand(m)
 	var o logOptions
 	l := &cobra.Command{Use: "logs <id>", Short: "Agent transcript as plain text", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
 		o.raw = o.raw || a.json
@@ -263,18 +261,7 @@ func (a *app) status(s core.Snapshot) error {
 		return a.print(s)
 	}
 	fmt.Fprintf(a.out, "Changathi: %d projects, %d recorded agents\n", len(s.Projects), len(s.Agents))
-	if s.ProviderWait != nil {
-		fmt.Fprintf(a.out, "Provider paused until %s: %s\n", s.ProviderWait.Until.Local().Format(time.RFC3339), s.ProviderWait.Reason)
-	}
-	queued := 0
-	for _, m := range s.Messages {
-		if m.State == "queued" || m.State == "uncertain" {
-			queued++
-		}
-	}
-	if queued > 0 {
-		fmt.Fprintf(a.out, "%d messages queued or awaiting delivery review\n", queued)
-	}
+	a.printGates(s.ProviderWaits)
 	if s.Usage != nil {
 		fmt.Fprintln(a.out, "Provider limits:")
 		if err := a.display(s.Usage); err != nil {
@@ -292,10 +279,47 @@ func (a *app) status(s core.Snapshot) error {
 	}
 	return a.agentRows(agentRows(s, agentFilter{limit: 20}))
 }
-func (a *app) doctor(ctx context.Context) error {
+func (a *app) doctorCommand() *cobra.Command {
+	var models bool
+	cmd := &cobra.Command{Use: "doctor", Short: "Check local dependencies and authentication", RunE: func(c *cobra.Command, _ []string) error { return a.doctor(c.Context(), models) }}
+	cmd.Flags().BoolVar(&models, "models", false, "Run one minimal turn per allowed Claude model (uses a little quota)")
+	return cmd
+}
+
+// enabledProviders lists the providers the host configuration permits.
+func (a *app) enabledProviders() []string {
+	if a.config.Providers == nil {
+		return []string{"codex"}
+	}
+	out := []string{}
+	for _, name := range core.Providers {
+		if _, ok := a.config.Providers[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func (a *app) doctor(ctx context.Context, models bool) error {
 	results := map[string]string{}
 	failed := false
-	for _, tool := range []string{"git", "gh", a.config.Codex} {
+	check := func(name string, args ...string) (string, bool) {
+		out, e := core.Command(ctx, "", args[0], args[1:]...)
+		if e != nil {
+			failed = true
+			results[name] = e.Error()
+			return "", false
+		}
+		results[name] = out
+		return out, true
+	}
+	tools := []string{"git", "gh"}
+	executables := map[string]string{"codex": a.config.Codex, "claude": a.config.Claude}
+	enabled := a.enabledProviders()
+	for _, name := range enabled {
+		tools = append(tools, executables[name])
+	}
+	for _, tool := range tools {
 		p, e := exec.LookPath(tool)
 		if e != nil {
 			results[tool] = e.Error()
@@ -304,16 +328,51 @@ func (a *app) doctor(ctx context.Context) error {
 			results[tool] = p
 		}
 	}
-	for _, v := range []struct {
-		name string
-		args []string
-	}{{"github_auth", []string{"gh", "auth", "status"}}, {"codex_auth", []string{a.config.Codex, "login", "status"}}} {
-		out, e := core.Command(ctx, "", v.args[0], v.args[1:]...)
-		if e != nil {
-			failed = true
-			results[v.name] = e.Error()
-		} else {
-			results[v.name] = out
+	check("github_auth", "gh", "auth", "status")
+	for _, name := range enabled {
+		switch name {
+		case "codex":
+			check("codex_auth", a.config.Codex, "login", "status")
+		case "claude":
+			if version, ok := check("claude_version", a.config.Claude, "--version"); ok && !strings.HasPrefix(version, provider.ClaudeTestedVersion+" ") {
+				results["claude_version"] = fmt.Sprintf("%s (warning: tested with %s)", version, provider.ClaudeTestedVersion)
+			}
+			if out, ok := check("claude_auth", a.config.Claude, "auth", "status"); ok {
+				var status struct {
+					LoggedIn   bool   `json:"loggedIn"`
+					AuthMethod string `json:"authMethod"`
+				}
+				if json.Unmarshal([]byte(out), &status) == nil {
+					if status.LoggedIn {
+						results["claude_auth"] = "logged in (" + status.AuthMethod + ")"
+					} else {
+						failed = true
+						results["claude_auth"] = "not logged in; run `claude auth login`"
+					}
+				}
+			}
+			allowed := a.config.Providers["claude"].Models
+			results["claude_models"] = strings.Join(allowed, ", ")
+			if len(allowed) == 0 {
+				results["claude_models"] = "any (no allow-list)"
+			}
+			if models {
+				dir, err := os.MkdirTemp("", "changathi-doctor-")
+				if err != nil {
+					return err
+				}
+				defer os.RemoveAll(dir)
+				for _, m := range allowed {
+					probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+					status, err := provider.Claude{Command: a.config.Claude}.Probe(probeCtx, dir, m)
+					cancel()
+					if err != nil {
+						failed = true
+						status = err.Error()
+					}
+					results["model "+m] = status
+				}
+			}
 		}
 	}
 	if err := a.display(results); err != nil {
@@ -323,4 +382,10 @@ func (a *app) doctor(ctx context.Context) error {
 		return fmt.Errorf("one or more checks failed")
 	}
 	return nil
+}
+
+func (a *app) printGates(gates []core.ProviderGate) {
+	for _, g := range gates {
+		fmt.Fprintf(a.out, "Provider %s paused until %s: %s\n", core.GateKey(g.Provider, g.Model), g.Until.Local().Format(time.RFC3339), singleLine(g.Reason))
+	}
 }

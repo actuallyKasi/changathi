@@ -2,6 +2,7 @@ package service
 
 import (
 	"changathi/internal/core"
+	"changathi/internal/provider"
 	"context"
 	"fmt"
 	"strings"
@@ -171,7 +172,7 @@ func TestSupervisorHumanReviewAndRestart(t *testing.T) {
 	}
 	g.close(3, "completed")
 	// A new engine uses the same durable store and reconciles instead of repeating child 3.
-	e = New(e.Config, e.Store, g, &fakeProvider{})
+	e = New(e.Config, e.Store, g, map[string]provider.Provider{"codex": &fakeProvider{}})
 	e.poll(ctx)
 	as = ownedAttempts(t, e)
 	if len(as) != 2 || as[0].State != "done" || as[1].Issue.Number != 4 {
@@ -187,7 +188,7 @@ func TestSupervisorHumanReviewAndRestart(t *testing.T) {
 	if count != 0 {
 		t.Fatal("supervisor occupied worker slot")
 	}
-	if _, err := e.enqueueIssue(ctx, p, g.nodes[2], false); err == nil {
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[2], false, "manual"); err == nil {
 		t.Fatal("parent dispatched as worker")
 	}
 	if _, err := e.Store.Enqueue(p, g.nodes[4], "auto", false); err == nil {
@@ -313,7 +314,7 @@ func TestSupervisorPauseCancelAndOutage(t *testing.T) {
 	if v.Hold != "paused" || as[0].State != "cancelled" {
 		t.Fatal(v, as)
 	}
-	if _, err := e.enqueueIssue(ctx, p, g.nodes[3], true); err == nil {
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[3], true, "manual"); err == nil {
 		t.Fatal("manual retry bypassed pause")
 	}
 	actionSuper(t, e, p, "resume", false)
@@ -387,7 +388,7 @@ func TestSupervisorExternalEvidenceAndParentReview(t *testing.T) {
 	if v.State != "waiting_review" || v.Current != 4 || len(ownedAttempts(t, e)) != 0 {
 		t.Fatal(v)
 	}
-	if _, err = e.enqueueIssue(ctx, p, g.nodes[4], false); err == nil {
+	if _, err = e.enqueueIssue(ctx, p, g.nodes[4], false, "manual"); err == nil {
 		t.Fatal("manual-only gate started a code worker")
 	}
 	g.close(4, "completed")
@@ -444,7 +445,7 @@ func TestSupervisorDurablePausedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	e = New(e.Config, reopened, g, &fakeProvider{})
+	e = New(e.Config, reopened, g, map[string]provider.Provider{"codex": &fakeProvider{}})
 	e.poll(ctx)
 	v, _ := e.Store.SupervisorFor(p.ID, 2)
 	if v.Hold != "paused" || len(ownedAttempts(t, e)) != 1 {
@@ -500,7 +501,11 @@ func TestSupervisorConcurrentTriggers(t *testing.T) {
 	var wg sync.WaitGroup
 	for n := 0; n < 10; n++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); _, _ = e.enqueueIssue(ctx, p, g.nodes[3], false); e.pollSupervisors(ctx) }()
+		go func() {
+			defer wg.Done()
+			_, _ = e.enqueueIssue(ctx, p, g.nodes[3], false, "manual")
+			e.pollSupervisors(ctx)
+		}()
 	}
 	wg.Wait()
 	if len(ownedAttempts(t, e)) != 1 {
@@ -664,10 +669,10 @@ func TestSupervisorRunsIndependentChildrenInParallel(t *testing.T) {
 	if err := e.eligible(ctx, p, *a3); err != nil {
 		t.Fatal("sibling failure blocked running child:", err)
 	}
-	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], false); err == nil {
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], false, "manual"); err == nil {
 		t.Fatal("failed child restarted without retry")
 	}
-	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], true); err != nil {
+	if _, err := e.enqueueIssue(ctx, p, g.nodes[5], true, "manual"); err != nil {
 		t.Fatal(err)
 	}
 	if a := latestChild(ownedAttempts(t, e), p.ID, 5); a.State != "queued" {
@@ -676,5 +681,46 @@ func TestSupervisorRunsIndependentChildrenInParallel(t *testing.T) {
 	// The dependent child still waits for its prerequisite.
 	if latestChild(ownedAttempts(t, e), p.ID, 4) != nil {
 		t.Fatal("dependent child dispatched early")
+	}
+}
+
+// Reworking a delivered child keeps its dependants waiting for the new delivery.
+func TestSupervisorReworkOfDeliveredChild(t *testing.T) {
+	e, g, p := supervisorSetup(t)
+	ctx := context.Background()
+	actionSuper(t, e, p, "start", false)
+	e.dispatch(ctx)
+	e.wg.Wait()
+	first := ownedAttempts(t, e)[0]
+	if first.State != "awaiting_review" {
+		t.Fatal(first)
+	}
+	second, err := e.rework(ctx, p, g.nodes[3], "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || second.Generation != 2 || second.SupervisorID != first.SupervisorID {
+		t.Fatal(second)
+	}
+	e.poll(ctx)
+	for _, a := range ownedAttempts(t, e) {
+		if a.Issue.Number == 4 {
+			t.Fatal("dependant started while its prerequisite was being reworked")
+		}
+	}
+	e.dispatch(ctx)
+	e.wg.Wait()
+	if a, _ := e.current(second.ID); a.State != "awaiting_review" {
+		t.Fatal(a)
+	}
+	g.close(3, "completed")
+	e.poll(ctx)
+	started := false
+	for _, a := range ownedAttempts(t, e) {
+		started = started || a.Issue.Number == 4
+	}
+	if !started {
+		v, _ := e.Store.SupervisorFor(p.ID, 2)
+		t.Fatal("dependant did not start after the reworked child closed", v.Reason)
 	}
 }

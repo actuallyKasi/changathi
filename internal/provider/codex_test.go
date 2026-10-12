@@ -40,7 +40,7 @@ func TestRPCProcess(t *testing.T) {
 			_ = enc.Encode(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread1", "turn": map[string]string{"id": "old-turn", "status": "failed"}}})
 			_ = enc.Encode(map[string]any{"method": "item/agentMessage/delta", "params": map[string]string{"threadId": "thread1", "turnId": "turn1", "delta": "hello"}})
 			_ = enc.Encode(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread1", "turn": map[string]string{"id": "turn1", "status": "completed"}}})
-		case "turn/steer", "turn/interrupt":
+		case "turn/interrupt":
 			reply(map[string]any{})
 		default: // deliberately leave unknown requests unanswered for cancellation testing
 		}
@@ -83,9 +83,6 @@ func TestCodexProtocol(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("missing streamed message")
-	}
-	if e = session.Steer(ctx, "Extra instruction", "message1"); e != nil {
-		t.Fatal(e)
 	}
 	short, stop := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer stop()

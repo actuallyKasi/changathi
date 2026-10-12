@@ -21,6 +21,7 @@ type agentRow struct {
 	Title   string    `json:"title"`
 	State   string    `json:"state"`
 	PR      int       `json:"pr,omitempty"`
+	Verify  string    `json:"verify,omitempty"`
 	Detail  string    `json:"detail,omitempty"`
 	Updated time.Time `json:"updated"`
 }
@@ -47,7 +48,15 @@ func newAgentRow(v core.Attempt, names map[string]string) agentRow {
 	if r := []rune(detail); len(r) > 160 {
 		detail = string(r[:160]) + "…"
 	}
-	return agentRow{ID: v.ID, Issue: fmt.Sprintf("%s#%d", names[v.ProjectID], v.Issue.Number), Title: singleLine(v.Issue.Title), State: v.State, PR: v.PR, Detail: detail, Updated: v.Updated}
+	return agentRow{ID: v.ID, Issue: fmt.Sprintf("%s#%d", names[v.ProjectID], v.Issue.Number), Title: singleLine(v.Issue.Title), State: v.State, PR: v.PR, Verify: latestVerdict(v), Detail: detail, Updated: v.Updated}
+}
+
+// latestVerdict is the newest verifier outcome, or empty when verification never ran.
+func latestVerdict(v core.Attempt) string {
+	if n := len(v.Verifications); n > 0 {
+		return v.Verifications[n-1].Verdict
+	}
+	return ""
 }
 
 // agentRows returns attempts newest first, skipping superseded generations.
@@ -75,6 +84,16 @@ func agentDetail(v core.Attempt, full bool) any {
 	var m map[string]any
 	_ = json.Unmarshal(data, &m)
 	delete(m, "workflow")
+	// Keep the role assignment and only the newest verdict from the omitted detail.
+	roles := map[string]string{}
+	for name, r := range v.Workflow.Roles() {
+		roles[name] = strings.TrimSpace(r.Provider + " " + r.Model)
+	}
+	m["agents"] = roles
+	delete(m, "verifications")
+	if n := len(v.Verifications); n > 0 {
+		m["verification"] = v.Verifications[n-1]
+	}
 	if issue, ok := m["issue"].(map[string]any); ok {
 		delete(issue, "body")
 	}
@@ -90,9 +109,13 @@ func (a *app) agentRows(rows []agentRow) error {
 		return err
 	}
 	w := tabwriter.NewWriter(a.out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "AGENT\tISSUE\tSUBJECT\tSTATE\tPR\tDETAIL")
+	fmt.Fprintln(w, "AGENT\tISSUE\tSUBJECT\tSTATE\tPR\tVERIFY\tDETAIL")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n", r.ID, r.Issue, r.Title, r.State, r.PR, r.Detail)
+		verify := r.Verify
+		if verify == "" {
+			verify = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", r.ID, r.Issue, r.Title, r.State, r.PR, verify, r.Detail)
 	}
 	return w.Flush()
 }
@@ -104,27 +127,20 @@ type supervisorRow struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-type messageRow struct {
-	ID    string `json:"id"`
-	Agent string `json:"agent"`
-	State string `json:"state"`
-	Error string `json:"error,omitempty"`
-}
-
 // summaryView answers "what is running and what needs a human?" in one call.
 type summaryView struct {
-	ProviderWait   *core.ProviderGate `json:"provider_wait,omitempty"`
-	PausedProjects []string           `json:"paused_projects,omitempty"`
-	Running        []agentRow         `json:"running"`
-	NeedsAttention []agentRow         `json:"needs_attention"`
-	AwaitingReview []agentRow         `json:"awaiting_review"`
-	Supervisors    []supervisorRow    `json:"supervisors,omitempty"`
-	Messages       []messageRow       `json:"messages,omitempty"`
+	ProviderWait   *core.ProviderGate  `json:"provider_wait,omitempty"`
+	ProviderWaits  []core.ProviderGate `json:"provider_waits,omitempty"`
+	PausedProjects []string            `json:"paused_projects,omitempty"`
+	Running        []agentRow          `json:"running"`
+	NeedsAttention []agentRow          `json:"needs_attention"`
+	AwaitingReview []agentRow          `json:"awaiting_review"`
+	Supervisors    []supervisorRow     `json:"supervisors,omitempty"`
 }
 
 func summarize(s core.Snapshot) summaryView {
 	names := projectNames(s)
-	v := summaryView{ProviderWait: s.ProviderWait, Running: []agentRow{}, NeedsAttention: []agentRow{}, AwaitingReview: []agentRow{}}
+	v := summaryView{ProviderWait: s.ProviderWait, ProviderWaits: s.ProviderWaits, Running: []agentRow{}, NeedsAttention: []agentRow{}, AwaitingReview: []agentRow{}}
 	for _, p := range s.Projects {
 		if !p.Enabled {
 			v.PausedProjects = append(v.PausedProjects, p.Name)
@@ -158,11 +174,6 @@ func summarize(s core.Snapshot) summaryView {
 		}
 		v.Supervisors = append(v.Supervisors, supervisorRow{Issue: fmt.Sprintf("%s#%d", names[sv.ProjectID], sv.Parent.Number), Title: singleLine(sv.Parent.Title), State: sv.State, Reason: singleLine(sv.Reason)})
 	}
-	for _, m := range s.Messages {
-		if m.State == "queued" || m.State == "uncertain" {
-			v.Messages = append(v.Messages, messageRow{ID: m.ID, Agent: m.AttemptID, State: m.State, Error: singleLine(m.Error)})
-		}
-	}
 	return v
 }
 
@@ -181,9 +192,7 @@ func (a *app) summary() *cobra.Command {
 }
 
 func (a *app) printSummary(v summaryView) error {
-	if v.ProviderWait != nil {
-		fmt.Fprintf(a.out, "Provider paused until %s: %s\n", v.ProviderWait.Until.Local().Format(time.RFC3339), singleLine(v.ProviderWait.Reason))
-	}
+	a.printGates(v.ProviderWaits)
 	if len(v.PausedProjects) > 0 {
 		fmt.Fprintf(a.out, "Paused projects: %s\n", strings.Join(v.PausedProjects, ", "))
 	}
@@ -215,12 +224,6 @@ func (a *app) printSummary(v summaryView) error {
 		fmt.Fprintf(a.out, "\nSupervisors (%d)\n", len(v.Supervisors))
 		for _, s := range v.Supervisors {
 			fmt.Fprintf(a.out, "  %s  %s  %s  %s\n", s.Issue, s.State, s.Title, s.Reason)
-		}
-	}
-	if len(v.Messages) > 0 {
-		fmt.Fprintf(a.out, "\nMessages awaiting delivery (%d)\n", len(v.Messages))
-		for _, m := range v.Messages {
-			fmt.Fprintf(a.out, "  %s  agent %s  %s  %s\n", m.ID, m.Agent, m.State, m.Error)
 		}
 	}
 	return nil

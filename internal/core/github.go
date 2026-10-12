@@ -16,6 +16,7 @@ type GitHub interface {
 	Issues(context.Context, Project, bool) ([]Issue, error)
 	FindPR(context.Context, Project, string) (*PR, error)
 	CreatePR(context.Context, Project, Attempt) (*PR, error)
+	ReviewComment(context.Context, Project, int, string) error
 	Merge(context.Context, Project, *PR, string) error
 	MarkReview(context.Context, Project, int) error
 	Prepare(context.Context, Project) ([]string, error)
@@ -56,9 +57,20 @@ func (g GH) Issue(ctx context.Context, p Project, n int) (Issue, error) {
 	return i, e
 }
 func (g GH) Issues(ctx context.Context, p Project, ready bool) ([]Issue, error) {
-	path := "repos/" + p.Repo + "/issues?state=open&per_page=100&sort=created&direction=asc"
 	if ready {
-		path += "&labels=agent%3Aready"
+		return g.Labeled(ctx, p, "agent:ready")
+	}
+	return g.openIssues(ctx, p, "")
+}
+
+// Labeled lists open issues carrying label, oldest first.
+func (g GH) Labeled(ctx context.Context, p Project, label string) ([]Issue, error) {
+	return g.openIssues(ctx, p, label)
+}
+func (g GH) openIssues(ctx context.Context, p Project, label string) ([]Issue, error) {
+	path := "repos/" + p.Repo + "/issues?state=open&per_page=100&sort=created&direction=asc"
+	if label != "" {
+		path += "&labels=" + url.QueryEscape(label)
 	}
 	out := []Issue{}
 	for page := 1; ; page++ {
@@ -141,11 +153,20 @@ func (g GH) FindPR(ctx context.Context, p Project, branch string) (*PR, error) {
 }
 func (g GH) CreatePR(ctx context.Context, p Project, a Attempt) (*PR, error) {
 	body := fmt.Sprintf("Implements issue #%d.\n\nManaged by Changathi. Leave the issue open for human review after merge.", a.Issue.Number)
+	if notes := a.VerificationNotes(); notes != "" {
+		body += "\n\n### Verification notes\n\n" + notes
+	}
 	_, e := Command(ctx, "", "gh", "pr", "create", "--repo", p.Repo, "--head", a.Branch, "--base", p.Base, "--title", fmt.Sprintf("[Changathi] %s", a.Issue.Title), "--body", body)
 	if e != nil {
 		return nil, e
 	}
 	return g.FindPR(ctx, p, a.Branch)
+}
+
+// ReviewComment posts a COMMENT review, which GitHub permits on the author's own PR.
+func (g GH) ReviewComment(ctx context.Context, p Project, number int, body string) error {
+	_, e := Command(ctx, "", "gh", "pr", "review", strconv.Itoa(number), "--repo", p.Repo, "--comment", "--body", body)
+	return e
 }
 func (g GH) Merge(ctx context.Context, p Project, pr *PR, method string) error {
 	_, e := Command(ctx, "", "gh", "pr", "merge", strconv.Itoa(pr.Number), "--repo", p.Repo, "--"+method, "--match-head-commit", pr.Head)
@@ -175,15 +196,25 @@ func (g GH) MarkReview(ctx context.Context, p Project, n int) error {
 		return e
 	}
 	if i.Ready() {
-		return g.api(ctx, fmt.Sprintf("repos/%s/issues/%d/labels/agent%%3Aready", p.Repo, n), nil, "--method", "DELETE")
+		return g.RemoveLabel(ctx, p, n, "agent:ready")
 	}
 	return nil
+}
+
+// RemoveLabel removes label from issue n; a label that is already gone is not an error.
+func (g GH) RemoveLabel(ctx context.Context, p Project, n int, label string) error {
+	name := strings.ReplaceAll(url.PathEscape(label), ":", "%3A")
+	e := g.api(ctx, fmt.Sprintf("repos/%s/issues/%d/labels/%s", p.Repo, n, name), nil, "--method", "DELETE")
+	if e != nil && strings.Contains(e.Error(), "HTTP 404") {
+		return nil
+	}
+	return e
 }
 
 // Prepare creates the labels Changathi relies on and reports setup problems
 // that would block dispatch, such as a missing WORKFLOW.md on the base branch.
 func (g GH) Prepare(ctx context.Context, p Project) ([]string, error) {
-	for _, l := range []struct{ name, color string }{{"agent:ready", "0e8a16"}, {"agent:review", "5319e7"}, {"supervisor", "1d76db"}} {
+	for _, l := range []struct{ name, color string }{{"agent:ready", "0e8a16"}, {"agent:review", "5319e7"}, {"agent:rework", "d93f0b"}, {"supervisor", "1d76db"}} {
 		if e := g.ensureLabel(ctx, p, l.name, l.color); e != nil {
 			return nil, fmt.Errorf("create label %s: %w", l.name, e)
 		}

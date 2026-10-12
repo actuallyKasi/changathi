@@ -33,7 +33,7 @@ func PrivateEnvironment() []string {
 	for _, v := range os.Environ() {
 		key := strings.SplitN(v, "=", 2)[0]
 		switch key {
-		case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ", "TERM", "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY":
+		case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ", "TERM", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY":
 			out = append(out, v)
 		default:
 			if strings.HasPrefix(key, "LC_") {

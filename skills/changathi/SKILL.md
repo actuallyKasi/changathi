@@ -1,11 +1,11 @@
 ---
 name: changathi
-description: Drive the Changathi coding-agent orchestrator. Use when onboarding a GitHub repository to Changathi, writing issues for its agents, coordinating dependent issues with a supervisor plan, or checking on, steering, retrying or stopping running agents.
+description: Drive the Changathi coding-agent orchestrator. Use when onboarding a GitHub repository to Changathi, writing issues for its agents, coordinating dependent issues with a supervisor plan, or checking on, reworking or stopping agents.
 ---
 
 # Changathi
 
-Changathi is a local daemon that runs Codex agents on GitHub issues. Each issue gets its own worktree. When the agent commits, Changathi runs the repository's validation, opens a PR and merges it once checks pass. The issue then stays open with `agent:review` until a human closes it.
+Changathi is a local daemon that runs coding agents (Codex or Claude) on GitHub issues. Each issue gets its own worktree. When the agent commits, Changathi runs the repository's validation, opens a PR and merges it once checks pass. The issue then stays open with `agent:review` until a human closes it.
 
 Use the `changathi` CLI to talk to the daemon, and `gh` for anything that only touches GitHub, such as creating or editing issues. Add `--json` when you need to parse output. The default text output is compact tables, which are usually cheaper to read.
 
@@ -14,7 +14,8 @@ Start with `changathi summary`. It reports what is running, what needs attention
 ## Before anything else
 
 ```sh
-changathi doctor            # git, gh, codex present and authenticated
+changathi doctor            # git, gh and enabled providers present and authenticated (--models probes each Claude model)
+                            # pass the daemon's --config too, or doctor checks Codex only
 changathi summary           # fails with "cannot reach daemon" if it isn't running
 ```
 
@@ -40,6 +41,16 @@ If the daemon isn't running, offer `changathi daemon install`: it sets the daemo
    Follow AGENTS.md and existing repository conventions.
    ```
 
+   To use Claude, add an `agents` block (instead of `model`). A typical setup is Opus to implement and Sonnet to verify:
+
+   ```yaml
+   agents:
+     implement: {provider: claude, model: claude-opus-5-5, effort: high}
+     verify: {provider: claude, model: claude-sonnet-5-5, effort: medium}
+   ```
+
+   The verifier reviews each validated head read-only. Its blocking findings go back to the implementer, and its notes are posted on the PR as a review comment. Every role's provider and model must be on the daemon's `providers` allow-list (see `examples/config.yaml`); otherwise the project shows a workflow error and nothing dispatches. Ask the user before choosing models, since they decide the cost.
+
    The body is a Go `text/template` that receives `.Issue`. Keep it short, because Changathi already adds the issue text and delivery rules to the prompt.
 3. Register the repository:
 
@@ -47,7 +58,7 @@ If the daemon isn't running, offer `changathi daemon install`: it sets the daemo
    changathi project add <name> --repo owner/repo [--auto] [--concurrency N]
    ```
 
-   This creates the `agent:ready`, `agent:review` and `supervisor` labels and warns if `WORKFLOW.md` is missing on the base branch. Fix any warning before you dispatch work. `--auto` picks up open issues labelled `agent:ready` and parents labelled `supervisor`. Without it, issues run only when you call `issue run`. Ask the user which one they want if they haven't said.
+   This creates the `agent:ready`, `agent:review`, `agent:rework` and `supervisor` labels and warns if `WORKFLOW.md` is missing on the base branch. Fix any warning before you dispatch work. `--auto` picks up open issues labelled `agent:ready` and parents labelled `supervisor`. Without it, issues run only when you call `issue run`. Ask the user which one they want if they haven't said.
 
 ## Write an issue an agent can finish
 
@@ -97,22 +108,27 @@ changathi issue run '<project>#<number>'                                        
 
 A child counts as complete only when its PR is merged **and** a human closes the issue as completed. If the parent body changes, run `supervisor reload` and then `reload --apply` (the plan stays paused), followed by `supervisor resume`. Work that was done outside Changathi is accepted with `supervisor reconcile --child N --pr M`. For `requires_evidence` children, the human reviews the evidence, closes the child and posts the `/approve-evidence #PR URL` comment that Changathi suggests on it. `supervisor reconcile --child N --ack-completion --evidence <url>` is the CLI fallback. Never post approvals, make up an evidence URL or acknowledge completion on the user's behalf.
 
-## Check in and steer
+## Check in
 
 ```sh
 changathi summary                              # start here
-changathi agent list --active                  # compact rows; --project P, --limit N
-changathi agent show <id>                      # one agent, no workflow or issue body (--full for all)
+changathi agent list --active                  # compact rows with the latest verdict; --project P, --limit N
+changathi agent show <id>                      # one agent: roles, latest verdict; no workflow or issue body (--full for all)
 changathi agent logs <id> --last               # the agent's last message and what followed
 changathi agent logs <id> --tail 20            # last 20 transcript items; --full adds tool output
-changathi agent message <id> --text "..."      # steers the current turn or queues for the next
-changathi issue retry '<project>#<number>'     # rerun unfinished or failed work, keeping its worktree
+changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub
 changathi issue cancel '<project>#<number>'    # stop the active attempt for an issue
 changathi project pause|resume <name>
-changathi usage                                # provider account limits
+changathi usage                                # Codex account limits; Claude tokens and cost per model, last rate-limit window
 ```
 
-When an agent shows `needs_attention`, read `agent logs <id> --last` and say why it stopped before you retry it. A blocked merge usually means a failing required check or a branch-protection rule. A message marked `uncertain` may or may not have reached the agent. Check before you resend it.
+When an agent shows `needs_attention`, read `agent logs <id> --last` and say why it stopped before you retry it. A blocked merge usually means a failing required check or a branch-protection rule. "verification failed N times" means the verifier kept finding blocking problems; its findings are in the logs and in `agent show`. A `waiting_account` agent is paused on a provider or model limit and resumes on its own. The same reason is posted as a comment on the issue.
+
+There is no way to message a running agent. The user reviews and asks for rework on GitHub:
+
+- **Rework of the same issue** (it stopped, or it merged but misses the acceptance criteria): they comment on the issue with what to change, then add the `agent:rework` label. Changathi removes the label, re-queues the issue (a new generation with a new PR if the old one merged) and passes their comments to the agent. Only comments by the `gh` login Changathi runs as reach the agent. If they ask you to do this, draft the comment for them to post or approve; don't post it as them unasked.
+- **A separate bug or follow-up idea**: a new issue that links back. The original is closed as completed once its own criteria are met.
+- **Supervisor children**: rework before the child is closed, so its dependants wait for the new delivery. Never close and reopen a child to trigger rework.
 
 ## Leave to the human
 

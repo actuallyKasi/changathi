@@ -50,7 +50,7 @@ func (g GH) Operator(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if u.Login == "" || u.Type != "User" {
-		return "", fmt.Errorf("supervision requires a human GitHub operator login")
+		return "", fmt.Errorf("Changathi requires a human GitHub operator login")
 	}
 	return u.Login, nil
 }
@@ -77,11 +77,16 @@ func (g GH) Delivery(ctx context.Context, p Project, n int) (DeliveryEvidence, e
 	return v, err
 }
 func (g GH) SupervisorWorkpad(ctx context.Context, p Project, n int, id, body string) (int64, error) {
+	return g.upsertComment(ctx, p, n, "<!-- changathi-supervisor:"+id+" -->", body)
+}
+
+// upsertComment edits the operator's comment on issue n that carries marker, or
+// creates one. The stable marker recovers a successful POST whose response was lost.
+func (g GH) upsertComment(ctx context.Context, p Project, n int, marker, body string) (int64, error) {
 	user, err := g.Operator(ctx)
 	if err != nil {
 		return 0, err
 	}
-	marker := "<!-- changathi-supervisor:" + id + " -->"
 	var commentID int64
 	for page := 1; ; page++ {
 		var comments []struct {
@@ -118,7 +123,7 @@ func (g GH) SupervisorWorkpad(ctx context.Context, p Project, n int, id, body st
 		return 0, err
 	}
 	if response.ID == 0 {
-		return 0, fmt.Errorf("workpad response missing comment ID")
+		return 0, fmt.Errorf("comment response missing comment ID")
 	}
 	return response.ID, nil
 }

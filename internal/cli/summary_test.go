@@ -23,7 +23,6 @@ func summaryFixture() core.Snapshot {
 			at("run", 2, 1, "running", 3), at("stuck", 3, 1, "needs_attention", 4), at("done", 4, 1, "done", 5),
 		},
 		Supervisors: []core.Supervisor{{ProjectID: "p1", Parent: core.Issue{Number: 9}, State: "waiting_review"}, {ProjectID: "p1", Parent: core.Issue{Number: 8}, State: "done"}},
-		Messages:    []core.Message{{ID: "m1", AttemptID: "run", State: "uncertain"}, {ID: "m2", AttemptID: "run", State: "acknowledged"}},
 	}
 }
 
@@ -39,7 +38,7 @@ func TestSummaryReportsOnlyCurrentWorkNeedingAction(t *testing.T) {
 	if ids(v.Running) != "run" || ids(v.NeedsAttention) != "stuck" || ids(v.AwaitingReview) != "new" {
 		t.Fatalf("%+v", v)
 	}
-	if len(v.Supervisors) != 1 || v.Supervisors[0].Issue != "backend#9" || len(v.Messages) != 1 || v.Messages[0].ID != "m1" {
+	if len(v.Supervisors) != 1 || v.Supervisors[0].Issue != "backend#9" {
 		t.Fatalf("%+v", v)
 	}
 	if strings.Join(v.PausedProjects, ",") != "frontend" {

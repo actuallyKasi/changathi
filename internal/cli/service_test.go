@@ -7,6 +7,7 @@ import (
 	"changathi/packaging"
 	"context"
 	"encoding/json"
+	"github.com/spf13/cobra"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,5 +143,36 @@ func TestDaemonInstallIsIdempotent(t *testing.T) {
 	}
 	if _, err := os.Stat(file); !os.IsNotExist(err) {
 		t.Fatal("unit file left behind")
+	}
+}
+
+// Installing a Claude-only daemon must not require codex on PATH.
+func TestServiceUnitResolvesEnabledProviders(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not installed")
+	}
+	fake := t.TempDir()
+	for _, name := range []string{"gh", "claude"} {
+		if err := os.WriteFile(filepath.Join(fake, name), []byte("#!/bin/sh\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", fake+string(os.PathListSeparator)+filepath.Dir(git))
+	a := &app{config: core.DefaultConfig()}
+	a.config.Codex = "codex-not-installed"
+	a.config.Providers = map[string]core.ProviderPolicy{"claude": {}}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("data-dir", "", "")
+	unit, err := a.serviceUnit(cmd, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(unit.Path, fake) {
+		t.Fatalf("claude's directory missing from service PATH: %s", unit.Path)
+	}
+	a.config.Providers = nil // Codex-only default still requires codex
+	if _, err = a.serviceUnit(cmd, t.TempDir()); err == nil || !strings.Contains(err.Error(), "codex-not-installed") {
+		t.Fatalf("codex requirement: %v", err)
 	}
 }

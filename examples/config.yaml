@@ -3,5 +3,13 @@ data_dir: /Users/you/.local/share/changathi
 concurrency: 1
 poll_seconds: 30
 codex: codex
+claude: claude
+# Host allow-list of providers and models. Repository workflows can't widen it.
+# Omit this block to keep Codex-only behavior.
+providers:
+  codex:
+    models: []          # empty: any model
+  claude:
+    models: [claude-opus-5-5, claude-sonnet-5-5]
 max_log_bytes: 16777216
 event_limit: 10000

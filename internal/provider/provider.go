@@ -18,11 +18,15 @@ type Request struct {
 	Thread    string
 	Model     string
 	Prompt    string
+	Effort    string
+	// ReadOnly selects the verifier posture: no edits, no resume, read-only tools.
+	ReadOnly bool
+	// Schema requests structured output validated against this JSON Schema.
+	Schema string
 }
 type Session interface {
 	Start(context.Context, Request) error
 	Run(context.Context, string, func(Event)) error
-	Steer(context.Context, string, string) error
 	Close() error
 }
 type Provider interface {

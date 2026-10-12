@@ -9,19 +9,21 @@ import (
 )
 
 type Workflow struct {
-	Model          string   `json:"model,omitempty" yaml:"model"`
-	Validation     []string `json:"validation" yaml:"validation"`
-	RequiredChecks []string `json:"required_checks" yaml:"required_checks"`
-	MergeMethod    string   `json:"merge_method" yaml:"merge_method"`
-	MaxTurns       int      `json:"max_turns" yaml:"max_turns"`
-	TimeoutSeconds int      `json:"timeout_seconds" yaml:"timeout_seconds"`
-	Concurrency    int      `json:"concurrency" yaml:"concurrency"`
-	Prompt         string   `json:"prompt" yaml:"-"`
-	Revision       string   `json:"revision" yaml:"-"`
+	Model           string   `json:"model,omitempty" yaml:"model"`
+	Agents          *Agents  `json:"agents,omitempty" yaml:"agents"`
+	MaxVerifyRounds int      `json:"max_verify_rounds,omitempty" yaml:"max_verify_rounds"`
+	Validation      []string `json:"validation" yaml:"validation"`
+	RequiredChecks  []string `json:"required_checks" yaml:"required_checks"`
+	MergeMethod     string   `json:"merge_method" yaml:"merge_method"`
+	MaxTurns        int      `json:"max_turns" yaml:"max_turns"`
+	TimeoutSeconds  int      `json:"timeout_seconds" yaml:"timeout_seconds"`
+	Concurrency     int      `json:"concurrency" yaml:"concurrency"`
+	Prompt          string   `json:"prompt" yaml:"-"`
+	Revision        string   `json:"revision" yaml:"-"`
 }
 
 func ParseWorkflow(data, revision string) (Workflow, error) {
-	w := Workflow{MergeMethod: "squash", MaxTurns: 5, TimeoutSeconds: 3600, Concurrency: 1, Revision: revision}
+	w := Workflow{MergeMethod: "squash", MaxTurns: 5, MaxVerifyRounds: 2, TimeoutSeconds: 3600, Concurrency: 1, Revision: revision}
 	body := data
 	if strings.HasPrefix(data, "---\n") {
 		parts := strings.SplitN(data[4:], "\n---", 2)
@@ -39,11 +41,14 @@ func ParseWorkflow(data, revision string) (Workflow, error) {
 	if len(w.Validation) == 0 {
 		return w, fmt.Errorf("WORKFLOW.md requires at least one validation command")
 	}
-	if w.MaxTurns < 1 || w.TimeoutSeconds < 1 || w.Concurrency < 1 {
+	if w.MaxTurns < 1 || w.TimeoutSeconds < 1 || w.Concurrency < 1 || w.MaxVerifyRounds < 1 {
 		return w, fmt.Errorf("invalid workflow limits")
 	}
 	if w.MergeMethod != "squash" && w.MergeMethod != "merge" && w.MergeMethod != "rebase" {
 		return w, fmt.Errorf("invalid merge method")
+	}
+	if e := w.validateAgents(); e != nil {
+		return w, e
 	}
 	_, e := template.New("workflow").Option("missingkey=error").Parse(w.Prompt)
 	return w, e

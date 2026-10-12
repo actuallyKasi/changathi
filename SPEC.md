@@ -6,9 +6,9 @@ Implementation language: Go. Target platforms: macOS and Linux.
 
 ## 1. Purpose and scope
 
-Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands and agent messaging. The CLI is designed to be driven by a coding assistant (Claude) through a bundled skill, so its read commands return compact, bounded output.
+Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands. The operator reviews results and asks for rework on GitHub (§7); there is no channel for messaging a running agent. The CLI is designed to be driven by a coding assistant (Claude) through a bundled skill, so its read commands return compact, bounded output.
 
-The initial provider is Codex. A provider adapter boundary permits a later Claude implementation without replacing scheduling, storage, GitHub integration, or the CLI. Claude execution is outside v1.
+The initial provider is Codex. A provider adapter boundary permits a later Claude implementation without replacing scheduling, storage, GitHub integration, or the CLI. Claude execution was outside v1 and is now added by the extension in §15.
 
 The service is inspired by [Symphony](https://github.com/openai/symphony/blob/main/SPEC.md), particularly its polling, workspace, and repository workflow concepts. This is an independent design; it adds a multi-project registry, durable state, operator commands, and an explicit GitHub delivery lifecycle.
 
@@ -21,7 +21,7 @@ MUST and SHOULD identify required behavior and recommended behavior respectively
 - Personal use on macOS or Linux; no multi-user authorization system.
 - Both automatic issue pickup and explicit CLI dispatch.
 - Pull requests may be merged without human approval (Changathi's delivery controller merges; see §7).
-- Commands, an agent-facing skill, and messages to agents.
+- Commands, an agent-facing skill, and a review loop on GitHub issues.
 - Codex initially, with an extensible provider interface.
 - Git worktrees for per-issue execution.
 
@@ -41,9 +41,9 @@ Components:
 | GitHub adapter | Issues, labels, PRs, checks, reconciliation, mutations |
 | Scheduler | Eligibility, claims, fairness, retries, account capacity |
 | Workspace manager | Managed clones, branches, worktrees, retention |
-| Agent runner | Provider sessions, turns, messages, events, interruption |
+| Agent runner | Provider sessions, turns, events, interruption |
 | Delivery controller | Validated PR publication and merge operations |
-| State store | SQLite records, durable messages, operation journal |
+| State store | SQLite records, operation journal |
 | Local API | Command interface and event streaming |
 
 The daemon MUST be the sole writer to its database. It MUST acquire an exclusive instance lock before dispatching. SQLite data and workspaces MUST reside on local storage. Running two independent daemons against the same repositories is unsupported in v1 and MUST be documented during setup.
@@ -55,13 +55,12 @@ Implementation note: the API is versioned HTTP (`/v1/status`, `/v1/events`, `/v1
 - Project: UUID, unique short name, GitHub host and immutable repository ID, owner/name, base branch, configuration, enabled status.
 - Work item: UUID, project ID, GitHub issue ID and number, source snapshot, execution generation, lifecycle state, associated PR, timestamps.
 - Attempt: UUID, work item ID, attempt number, provider, model, session/thread reference, workspace, configuration revision, status, failure reason, timing and usage.
-- Message: UUID, attempt ID, text, delivery state, provider turn reference, timestamps.
 - Event: monotonic sequence ID, project/work item/attempt references, timestamp, event type, structured payload.
 - Operation: idempotency key, intended external action, target, result, reconciliation status.
 
 Repository ID plus issue ID defines issue identity; issue number alone MUST NOT identify work across projects. Only one execution generation per issue may be active.
 
-SQLite persists claims, attempts, queued messages, outcomes, and external operation intent. Large logs live in permission-restricted files referenced from SQLite. Secrets MUST NOT appear in database records, generated prompts, or logs.
+SQLite persists claims, attempts, outcomes, and external operation intent. Large logs live in permission-restricted files referenced from SQLite. Secrets MUST NOT appear in database records, generated prompts, or logs.
 
 Implementation note: there is no separate work-item record. Each execution generation is one attempt record carrying the issue snapshot, generation number, trigger, lifecycle state, branch, PR, head/base SHAs, and the resolved workflow; retrying an undelivered generation re-queues that same attempt rather than creating a new one. Records are JSON documents in a `records(kind, id, data)` table in `<data_dir>/state.db` (WAL mode), and events live in an append-only `events` table whose autoincrement `seq` is the stream cursor, trimmed to `event_limit`. Identifiers are random 128-bit hex strings, not UUIDs. Per-attempt logs are `<data_dir>/logs/<attempt-id>.log`, rotated once at `max_log_bytes`. Mutating API requests are recorded by request ID so a retried request returns the cached result instead of acting twice.
 
@@ -87,7 +86,7 @@ Implementation note:
 
 Automatic pickup selects open issues with `agent:ready` in enabled projects that have automatic pickup turned on. Explicit `issue run` dispatches a specified open issue without requiring that label. Every dispatched item records its trigger; removing the label cancels eligibility only for automatic work.
 
-The daemon MUST re-fetch issue eligibility before dispatch and before starting delivery operations. Closed issues stop further execution. CLI cancellation prevents redispatch until an explicit retry or a new ready-label activation. User messages and edits to issue text do not implicitly create new attempts.
+The daemon MUST re-fetch issue eligibility before dispatch and before starting delivery operations. Closed issues stop further execution. CLI cancellation prevents redispatch until an explicit retry or a new ready-label activation. Issue comments and edits to issue text do not implicitly create new attempts; the operator requests rework explicitly (§7).
 
 Use round-robin selection between eligible projects, then oldest first within a project. Implementation note: "oldest" is issue creation order as returned by GitHub; issue priority and label-applied time are not used. Global and per-project capacity both apply. Retry waits, CI waits, and account-limit waits do not occupy an agent execution slot.
 
@@ -126,7 +125,18 @@ Existing branch protection is respected. If required human reviews prevent auton
 
 After merge, transition to `awaiting_review`, retain the issue open, remove readiness, and add `agent:review`. The agent and the delivery controller MUST avoid issue-closing keywords and automatic closing associations in managed PRs and commits. The controller MUST check those associations before merge. The human later closes the issue, which transitions local state to `done`. If an external automation unexpectedly closes the issue during merge, surface the discrepancy for the operator; do not silently treat it as human review or reopen a deliberately closed issue.
 
-An issue awaiting review MUST NOT be automatically dispatched again. A CLI retry/rework action creates a new execution generation and a new branch/PR when the previous PR was already merged. Conflicts or repeated failing validation become `needs_attention` after the configured limit.
+An issue awaiting review MUST NOT be automatically dispatched again. Only an explicit operator action, `issue retry` or the `agent:rework` label, reworks it; that creates a new execution generation and a new branch/PR when the previous PR was already merged. Conflicts or repeated failing validation become `needs_attention` after the configured limit.
+
+### Review loop on GitHub
+
+The operator reviews results and drives rework on GitHub, without the CLI:
+
+- **Status comments.** When an issue's latest attempt enters `needs_attention`, Changathi posts the reason, the last failure the agent saw, and the next step as a comment on the issue. When it reaches `awaiting_review`, the comment names the merged PR and the operator's choices. Each attempt has one status comment, edited in place and rewritten only when its content changes; a failed write is retried on the next poll. Failure text is posted as is, so it is visible to anyone who can read the issue.
+- **Rework trigger.** Adding the `agent:rework` label to an open issue in an enabled project requests rework, whether or not automatic pickup is on. Changathi removes the label before acting, so a lost removal cannot start rework twice, then re-queues exactly as `issue retry` does: the same generation (branch, worktree, open PR) when nothing merged, or a new generation that supersedes an `awaiting_review` one. A new generation also removes `agent:review`. A label added while the issue's attempt is still working takes effect once it stops. A refused request (for example a supervisor gate) is answered with a comment giving the reason.
+- **Operator comments in the prompt.** Rework captures the operator's issue comments created since the previous capture (or since the previous attempt was created) and adds them to the implement prompt as the operator's instructions. Only comments by the authenticated `gh` user with a `User` account are trusted; anyone else's comment could inject instructions. Changathi posts with the same login, so its own comments carry a hidden `<!-- changathi` marker and are skipped, as are `/approve-evidence` approvals. The newest comments are kept when they exceed the prompt budget (8 KiB each, 24 KiB in all). Comments are captured when rework is requested, not re-read during the run; edits to a comment after capture are ignored.
+- **Follow-ups.** A separate bug or idea found during review belongs in a new issue; the reviewed issue is closed as completed when its own criteria are met.
+
+Implementation note: the review loop needs the adapter's optional `core.Feedback` interface (the `gh` adapter implements it). Without it, status stays local and rework needs `issue retry`. Rework records trigger `rework` for the label and `manual` for `issue retry`.
 
 ## 8. Workspaces
 
@@ -147,7 +157,7 @@ Implementation note:
 
 ## 9. Agent provider boundary
 
-The Go runner interface MUST support capability discovery, session creation/resumption, starting a turn, streaming normalized events, interruption, and session shutdown. Messaging supports steering an active turn when available, or queueing for the next turn otherwise. The CLI MUST show which happened.
+The Go runner interface MUST support capability discovery, session creation/resumption, starting a turn, streaming normalized events, interruption, and session shutdown.
 
 Normalized events include session started, message delta, tool activity, turn completed/failed, usage update, account limitation, and input required. Provider-specific metadata can be preserved without driving core scheduling logic.
 
@@ -157,10 +167,9 @@ Prefer one app-server process per active attempt for process failure isolation. 
 
 Implementation note:
 
-- The Go interface is narrower than described above: `Provider.Open` returns a `Session` with `Start`, which starts or resumes a thread in the worktree, plus `Run` for one turn with streamed events, `Steer`, and `Close`. There is no capability discovery; interruption is context cancellation.
+- The Go interface is narrower than described above: `Provider.Open` returns a `Session` with `Start`, which starts or resumes a thread in the worktree, plus `Run` for one turn with streamed events, and `Close`. There is no capability discovery; interruption is context cancellation.
 - Each attempt gets its own `codex app-server` process with a reduced environment.
 - An account limit is recognized from provider error text ("rate limit", "usage limit", or "quota"). It sets a provider-wide gate that pauses all dispatch for five minutes and puts the attempt in `waiting_account`.
-- Messages are steered into the turn only while one is active. Otherwise they are queued and prepended to the next turn. A message sent while an attempt is in `waiting_checks` re-queues it for a new turn. Messages are refused while the controller is validating, publishing, or merging.
 
 ## 10. CLI and skill
 
@@ -178,7 +187,6 @@ changathi issue run|retry|cancel <project>#<number>
 changathi agent list [--active] [--project <name>] [--limit N]
 changathi agent show <attempt-id> [--full]
 changathi agent logs <attempt-id> [--tail N] [--last] [--full] [--follow] [--raw]
-changathi agent message <attempt-id> --text ...
 changathi agent stop <attempt-id>
 changathi supervisor ...            (see SUPERVISOR_SPEC.md)
 changathi usage
@@ -186,15 +194,13 @@ changathi workspace clean <attempt-id> [--apply]
 changathi skill install [--dir <repo>] [--print]
 ```
 
-`summary` reports, in one call, the running agents, the newest attempt for each issue that needs attention or awaits review, active supervisors, messages that are queued or uncertain, paused projects, and any provider pause. `agent list` returns compact rows (id, issue, title, state, PR, one-line detail), newest first, skips superseded generations, and defaults to 20 rows. `agent show` omits the recorded workflow and issue body unless `--full` is given. `agent logs` prints plain text; tool and diff output appears only for failed items unless `--full` is given, and `--tail`/`--last` bound the window. `daemon status --json` remains the full snapshot for debugging.
+`summary` reports, in one call, the running agents, the newest attempt for each issue that needs attention or awaits review, active supervisors, paused projects, and any provider pause. `agent list` returns compact rows (id, issue, title, state, PR, one-line detail), newest first, skips superseded generations, and defaults to 20 rows. `agent show` omits the recorded workflow and issue body unless `--full` is given. `agent logs` prints plain text; tool and diff output appears only for failed items unless `--full` is given, and `--tail`/`--last` bound the window. `daemon status --json` remains the full snapshot for debugging.
 
-`project add` also creates the `agent:ready`, `agent:review`, and `supervisor` labels and warns when `WORKFLOW.md` is missing from the base branch. Creating, editing, labelling, and closing issues are GitHub operations done with `gh`; Changathi does not wrap them. Issue closure remains an explicit human operation, separate from autonomous merge.
+`project add` also creates the `agent:ready`, `agent:review`, `agent:rework`, and `supervisor` labels and warns when `WORKFLOW.md` is missing from the base branch. Creating, editing, labelling, and closing issues are GitHub operations done with `gh`; Changathi does not wrap them. Issue closure remains an explicit human operation, separate from autonomous merge.
 
-`skill install` writes the skill embedded in the binary (`skills/changathi/SKILL.md`) to `~/.claude/skills/changathi/SKILL.md`, or under `<repo>/.claude/skills/` with `--dir`, so the installed skill always matches the CLI. The skill covers onboarding a repository, writing issues agents can finish, supervisor plans, and checking on and steering agents. `doctor` checks that `git`, `gh`, and Codex are on the path and runs `gh auth status` and `codex login status`.
+`skill install` writes the skill embedded in the binary (`skills/changathi/SKILL.md`) to `~/.claude/skills/changathi/SKILL.md`, or under `<repo>/.claude/skills/` with `--dir`, so the installed skill always matches the CLI. The skill covers onboarding a repository, writing issues agents can finish, supervisor plans, and checking on and reworking agents. `doctor` checks that `git`, `gh`, and Codex are on the path and runs `gh auth status` and `codex login status`.
 
 Commands MUST support explicit project selection, stable exit codes, and `--json` for machine-readable results where meaningful. Mutating commands use request IDs so transport retries do not duplicate actions. Event streams support reconnection from a sequence cursor or an explicit full refresh if history expired.
-
-Messages are durably queued before acknowledgment. Delivery records distinguish queued, sent, acknowledged, and uncertain. On ambiguous provider failure, do not silently duplicate steering messages. The operator can inspect uncertainty and resend deliberately.
 
 ## 11. Recovery and operational behavior
 
@@ -209,7 +215,6 @@ Graceful shutdown disables dispatch, requests provider interruption, records out
 Implementation note:
 
 - On startup, attempts left in `preparing`, `running`, `validating`, `pr_open`, or `merging` move to `retry_wait`, but only after their per-attempt execution lock (under `<data_dir>`) can be taken. If the lock is still held, the attempt becomes `needs_attention`.
-- Messages left in `sent` become `uncertain`.
 - Every resumed attempt checks GitHub for its branch's PR before doing anything else. A merged PR goes straight to the review step, and a PR closed without merging stops the attempt.
 - PR creation and merge are journaled as operation records (`intent`, then `complete` or `uncertain`).
 - A merge call that errors is followed by a PR state check, so a merge that succeeded despite the error is still recognized.
@@ -227,7 +232,7 @@ Structured logs and CLI diagnostics include project, issue, attempt, and operati
 7. Restart after PR creation or merge reconciles remote state without duplicate delivery.
 8. Account exhaustion preserves work and pauses dispatch without paid fallback.
 9. CLI disconnection leaves agents running; log/event reconnection is supported.
-10. Agent messages expose delivery state and survive daemon restart.
+10. A stopped or delivered attempt is explained on its GitHub issue, and `agent:rework` plus operator comments rework it without the CLI; other users' comments never reach the agent.
 11. Dirty worktrees survive failure and cleanup attempts.
 12. Provider contract tests use a fake provider; Codex integration tests exercise the pinned protocol on macOS and Linux.
 13. Merging a managed PR leaves its issue open in `awaiting_review`; polling does not redispatch it, and human closure completes the lifecycle.
@@ -238,10 +243,14 @@ Structured logs and CLI diagnostics include project, issue, attempt, and operati
 2. GitHub reading, manual dispatch, managed worktrees, Codex runner and events.
 3. Automatic polling, fair scheduling, retries, quota handling, restart recovery.
 4. Validation, PR delivery, autonomous merging, confirmed human-review lifecycle.
-5. Agent-facing commands and skill, messaging, service packaging.
+5. Agent-facing commands and skill, service packaging.
 
-All five stages are implemented. Direct remote client transport, GitHub webhooks, token-reference authentication, GitHub Enterprise hosts, time-based worktree retention, containers, multi-host execution, multiple users, cross-repository tasks, and Claude execution remain outside v1.
+All five stages are implemented. Direct remote client transport, GitHub webhooks, token-reference authentication, GitHub Enterprise hosts, time-based worktree retention, containers, multi-host execution, multiple users, and cross-repository tasks remain outside v1. Claude execution was added afterwards (§15).
 
 ## 14. Supervisor extension
 
 See [SUPERVISOR_SPEC.md](SUPERVISOR_SPEC.md) for the parent-issue supervisor, dependency gates, scheduling, persistence, and implementation acceptance criteria. The deterministic controller is implemented as an extension; the optional advisory agent remains deferred.
+
+## 15. Claude provider extension
+
+See [CLAUDE_PROVIDER_SPEC.md](CLAUDE_PROVIDER_SPEC.md) for the Claude provider adapter, per-role models (for example Opus to implement and Sonnet to verify), and the verification step between validation and publication. It is implemented as an extension; Codex-only workflows are unchanged.

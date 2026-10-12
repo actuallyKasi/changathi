@@ -59,9 +59,6 @@ func (a *app) readableLogs(ctx context.Context, id string, o logOptions) error {
 			t.Apply(e)
 		}
 		if initial {
-			if s, e := client.Status(ctx); e == nil {
-				t.Messages(s.Messages, id)
-			}
 			// --last and --tail skip everything before the requested window.
 			skip := 0
 			if o.tail > 0 {
