@@ -37,11 +37,15 @@ Because `~/.local/bin/changathi` is a symlink, later rebuilds update it in place
 
 ### 3. Run the daemon as a service
 
+Codex is the only provider until the service configuration enables others. To use Claude, copy [examples/config.yaml](examples/config.yaml) (it allows Claude Opus and Sonnet as well as Codex), delete its `data_dir` line to keep the default location, and pass it to every command below with `--config`:
+
 ```sh
-changathi daemon install                     # writes the service, starts it, waits until the daemon answers
+changathi daemon install                                        # Codex only
+changathi --config ~/.config/changathi.yaml daemon install      # with the providers it lists
+changathi --config ~/.config/changathi.yaml doctor --models     # also runs one tiny turn per allowed Claude model
 ```
 
-On macOS this writes the launchd agent `~/Library/LaunchAgents/dev.changathi.plist` and loads it; on Linux it writes the systemd user unit `~/.config/systemd/user/changathi.service` and enables it. The service runs the `changathi` on your PATH, and its `PATH` covers `git`, `gh`, `codex` and the rest of your current shell's `PATH`, so validation commands find the same tools as your terminal. Run install from a shell where those resolve.
+`daemon install` writes the service, starts it and waits until the daemon answers. On macOS this writes the launchd agent `~/Library/LaunchAgents/dev.changathi.plist` and loads it; on Linux it writes the systemd user unit `~/.config/systemd/user/changathi.service` and enables it. The service runs the `changathi` on your PATH with the same `--config`, and its `PATH` covers `git`, `gh`, the enabled providers' CLIs (`codex`, `claude`) and the rest of your current shell's `PATH`, so validation commands find the same tools as your terminal. Run install from a shell where those resolve.
 
 It is safe to re-run: if nothing changed it leaves the running daemon alone, otherwise it rewrites the file and restarts the service. Use `--print` to see the file without installing it, and `changathi daemon uninstall` to stop and remove the service (state in the data directory is kept). Logs go to `~/Library/Logs/changathi.log` and `changathi.error.log` on macOS and to `journalctl --user -u changathi` on Linux.
 
@@ -76,7 +80,7 @@ Implement issue #{{.Issue.Number}}: {{.Issue.Title}}.
 Follow AGENTS.md and existing repository conventions.
 ```
 
-[examples/WORKFLOW.md](examples/WORKFLOW.md) shows every option. Then register the repository:
+[examples/WORKFLOW.md](examples/WORKFLOW.md) shows every option, including the `agents` block that picks a provider and model per role, for example Claude Opus to implement and Claude Sonnet to verify. Then register the repository:
 
 ```sh
 changathi project add backend --repo owner/backend --auto
@@ -118,16 +122,19 @@ flowchart TB
     end
 
     subgraph issue["per issue"]
-        codex["codex app-server"]
+        agent["agent session<br/>(codex app-server or claude -p)"]
+        verifier["verifier session<br/>(read-only, optional)"]
         wt["worktree"]
-        codex -- "commits" --> wt
+        agent -- "commits" --> wt
+        verifier -. "reads" .-> wt
     end
 
     gh[("GitHub")]
 
     claude -- "changathi CLI" --> api
     ws --> wt
-    runner -- "stdio" --> codex
+    runner -- "stdio" --> agent
+    runner -- "stdio" --> verifier
     sched -- "poll issues" --> gh
     deliver -- "PR, checks, merge" --> gh
 ```
@@ -135,8 +142,8 @@ flowchart TB
 - **Local API.** Versioned HTTP over `<data_dir>/daemon.sock`, readable only by your user. The CLI is a thin client; quitting it never stops agents.
 - **Scheduler.** Polls GitHub every 30 seconds, round-robins between projects, and enforces global and per-project concurrency (both default to 1). Retry, CI and account-limit waits don't hold a slot.
 - **Workspace manager.** Keeps its own clone of each repository, separate from your checkout, and gives every issue a branch and worktree. Worktrees are never deleted automatically.
-- **Agent runner.** Starts a `codex app-server` per attempt with a reduced environment and no copied credentials, and streams its events to a per-attempt log.
-- **Delivery controller.** Takes the agent's commits, runs validation, publishes the PR and merges it.
+- **Agent runner.** Starts one provider session per role of an attempt (a `codex app-server`, or `claude -p` speaking stream-json) with a reduced environment and no copied credentials, and streams its events to a per-attempt log. The implement session is resumed across turns and restarts; a verify session is always fresh and read-only.
+- **Delivery controller.** Takes the agent's commits, runs validation and verification, publishes the PR and merges it.
 - **Supervisor.** Coordinates a parent issue's plan of dependent child issues. It is plain daemon logic and doesn't use an agent slot.
 - **State store.** One SQLite database holds projects, attempts, events and journaled GitHub operations, so the daemon can restart without losing or duplicating work.
 
@@ -150,6 +157,9 @@ stateDiagram-v2
     running --> validating: agent turn ends
     validating --> running: validation fails (next turn)
     validating --> pr_open: commits pass
+    validating --> verifying: commits pass, verify role set
+    verifying --> running: blocking findings (next turn)
+    verifying --> pr_open: verdict pass
     pr_open --> waiting_checks
     waiting_checks --> running: check fails (next turn)
     waiting_checks --> merging: checks green
@@ -167,6 +177,8 @@ stateDiagram-v2
 
 Anything that can't proceed on its own (exhausted turns, a merge blocked by branch protection, an execution lock still held after a restart) becomes `needs_attention`, and Changathi posts the reason on the issue.
 
+An account limit pauses that provider for five minutes (`waiting_account`) instead of failing the work; a Claude limit on one model's window (such as weekly Opus) pauses only that model. Work never falls back to another model or to API-key billing. A restart or a wait that happens after the agent's turn finished resumes at validation, without another agent turn, and a Claude session that can no longer be resumed continues in a fresh one that is told what the branch already holds.
+
 ### Reviewing and reworking on GitHub
 
 You never need to message an agent. Everything happens on the issue:
@@ -177,7 +189,7 @@ You never need to message an agent. Everything happens on the issue:
 | It merged but misses the acceptance criteria | Leave the issue open, comment what's missing, add `agent:rework` | Starts a new generation (new branch and PR) that knows the previous PR and your comments |
 | It's done, but you spotted a separate bug or idea | Close it as completed; open a new issue that links back | Treats the new issue like any other |
 
-Only your own comments (the `gh` login Changathi runs as) are passed to the agent; comments from anyone else are ignored. `changathi issue retry` does the same as the label from the CLI. For supervisor children, rework before you close the child: its dependants wait for the new delivery. An account limit pauses that provider for five minutes (`waiting_account`) instead of failing the work; a Claude limit on one model's window (such as weekly Opus) pauses only that model. Work never falls back to another model or to API-key billing.
+Only your own comments (the `gh` login Changathi runs as) are passed to the agent; comments from anyone else are ignored. `changathi issue retry` does the same as the label from the CLI. For supervisor children, rework before you close the child: its dependants wait for the new delivery.
 
 ### Dependent issues
 
@@ -221,7 +233,7 @@ CHANGATHI_CODEX_SMOKE=1 go test ./internal/provider -run TestInstalledCodexHands
 CHANGATHI_CLAUDE_SMOKE=1 go test ./internal/provider ./internal/service -run 'TestInstalledClaude|TestLiveClaude' -v
 ```
 
-The Codex smoke test checks the protocol handshake without running a model turn. The Claude smoke tests spend a few small turns: one verifier turn through the adapter, and an Opus-implements/Sonnet-verifies run against a local repository with GitHub faked. Automated tests use a fake provider and never touch real GitHub repositories.
+The Codex smoke test checks the protocol handshake without running a model turn. The Claude smoke tests spend a few small turns: one verifier turn through the adapter (plus a check that resuming a missing session is detected), and an Opus-implements/Sonnet-verifies run against a local repository with GitHub faked. Automated tests use a fake provider and never touch real GitHub repositories.
 
 | Package | Role |
 | --- | --- |

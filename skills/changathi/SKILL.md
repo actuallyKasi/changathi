@@ -15,6 +15,7 @@ Start with `changathi summary`. It reports what is running, what needs attention
 
 ```sh
 changathi doctor            # git, gh and enabled providers present and authenticated (--models probes each Claude model)
+                            # pass the daemon's --config too, or doctor checks Codex only
 changathi summary           # fails with "cannot reach daemon" if it isn't running
 ```
 
@@ -111,17 +112,17 @@ A child counts as complete only when its PR is merged **and** a human closes the
 
 ```sh
 changathi summary                              # start here
-changathi agent list --active                  # compact rows; --project P, --limit N
-changathi agent show <id>                      # one agent, no workflow or issue body (--full for all)
+changathi agent list --active                  # compact rows with the latest verdict; --project P, --limit N
+changathi agent show <id>                      # one agent: roles, latest verdict; no workflow or issue body (--full for all)
 changathi agent logs <id> --last               # the agent's last message and what followed
 changathi agent logs <id> --tail 20            # last 20 transcript items; --full adds tool output
 changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub
 changathi issue cancel '<project>#<number>'    # stop the active attempt for an issue
 changathi project pause|resume <name>
-changathi usage                                # provider account limits
+changathi usage                                # Codex account limits; Claude tokens and cost per model, last rate-limit window
 ```
 
-When an agent shows `needs_attention`, read `agent logs <id> --last` and say why it stopped before you retry it. A blocked merge usually means a failing required check or a branch-protection rule. The same reason is posted as a comment on the issue.
+When an agent shows `needs_attention`, read `agent logs <id> --last` and say why it stopped before you retry it. A blocked merge usually means a failing required check or a branch-protection rule. "verification failed N times" means the verifier kept finding blocking problems; its findings are in the logs and in `agent show`. A `waiting_account` agent is paused on a provider or model limit and resumes on its own. The same reason is posted as a comment on the issue.
 
 There is no way to message a running agent. The user reviews and asks for rework on GitHub:
 
