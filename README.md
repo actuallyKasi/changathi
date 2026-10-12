@@ -4,6 +4,17 @@ Changathi is a personal coding-agent orchestrator. One Go daemon watches GitHub 
 
 You don't drive it by hand. The CLI is built to be operated by Claude Code: install the bundled skill and ask Claude to onboard repositories, write issues, and check on agents. That is separate from the agents that do the issue work, which can be Codex or Claude per repository. You review results and ask for rework on GitHub itself. This README covers installation and how the system fits together; the day-to-day procedures live in the skill ([skills/changathi/SKILL.md](skills/changathi/SKILL.md)).
 
+## Start here
+
+> [!TIP]
+> **Let Claude set up your repositories.** Once Changathi is installed, open Claude Code in any repository and say:
+>
+> **"Onboard this repo to Changathi."**
+>
+> The bundled skill has Claude work out the validation commands, write and commit `WORKFLOW.md`, register the project, and write issues an agent can finish. You review and close the results.
+
+Installing Changathi is a one-time setup, described in [Getting started](#getting-started).
+
 ## Getting started
 
 ### 1. Prerequisites
@@ -68,7 +79,9 @@ Use `--dir <repo>` to install it into one repository's `.claude/skills/` instead
 
 ### 5. Add your first repository
 
-Each repository needs a `WORKFLOW.md` on its **default branch** that tells Changathi how to prove a change is good:
+Open Claude Code in the repository and ask it to onboard the repo to Changathi (see [Start here](#start-here)).
+
+To do it by hand: each repository needs a `WORKFLOW.md` on its **default branch** that tells Changathi how to prove a change is good:
 
 ```markdown
 ---
@@ -87,8 +100,6 @@ changathi project add backend --repo owner/backend --auto
 ```
 
 `project add` creates the `agent:ready`, `agent:review`, `agent:rework` and `supervisor` labels and warns if `WORKFLOW.md` is missing. With `--auto`, any open issue labelled `agent:ready` is picked up; without it, issues run only when dispatched with `changathi issue run 'backend#42'`.
-
-Simplest of all: open Claude in the repository and ask it to onboard the repo to Changathi. The skill walks it through writing `WORKFLOW.md`, registering the project and writing issues an agent can finish.
 
 ### 6. Hand it work
 
