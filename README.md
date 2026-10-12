@@ -110,20 +110,18 @@ From here, ask Claude how things are going. It uses `summary`, `agent logs` and 
 ### Components
 
 ```mermaid
-flowchart LR
+flowchart TB
     you(["You"]) --> claude["Claude + changathi skill"]
-    claude -- "changathi CLI" --> sock[["Unix socket<br/>HTTP API /v1"]]
-    claude -- "gh: create / edit issues" --> gh[("GitHub")]
+    claude -- "changathi CLI" --> api
+    claude -- "gh issue create / edit" --> gh[("GitHub")]
 
     subgraph daemon["changathi daemon"]
-        direction TB
-        sock --> api["Local API"]
-        api --> sched["Scheduler<br/>claims, fairness, retries"]
+        api["Local API<br/>unix socket, HTTP /v1"] --> sched["Scheduler<br/>claims, fairness, retries"]
         sched --> sup["Supervisor<br/>dependent issues"]
         sched --> ws["Workspace manager<br/>clones + worktrees"]
         sched --> runner["Agent runner"]
         runner --> deliver["Delivery controller<br/>validate, PR, merge"]
-        api & sched & deliver --> store[("SQLite state<br/>events, logs")]
+        store[("SQLite state<br/>events, logs")]
     end
 
     sched -- "poll agent:ready" --> gh
@@ -132,6 +130,8 @@ flowchart LR
     codex -- "edits + commits" --> wt["worktree"]
     ws --> wt
 ```
+
+All daemon components read and write the SQLite state store.
 
 - **Local API.** Versioned HTTP over `<data_dir>/daemon.sock`, readable only by your user. The CLI is a thin client; quitting it never stops agents.
 - **Scheduler.** Polls GitHub every 30 seconds, round-robins between projects, and enforces global and per-project concurrency (both default to 1). Retry, CI and account-limit waits don't hold a slot.
