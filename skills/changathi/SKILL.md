@@ -21,6 +21,11 @@ changathi summary           # fails with "cannot reach daemon" if it isn't runni
 
 If the daemon isn't running, offer `changathi daemon install`: it sets the daemon up as a launchd (macOS) or systemd (Linux) service, starts it and waits until it answers, and is safe to re-run. Ask before installing the service. Don't run `changathi daemon start` yourself in a shell that will exit.
 
+Check which providers the running daemon actually has before you onboard or dispatch anything:
+
+- The service's command line shows its config (`ps -o command= -p $(pgrep -f 'changathi daemon start')`). With no `--config`, or a config without a `providers` block, the daemon is Codex only, whatever `WORKFLOW.md` says.
+- A daemon started before the binary was rebuilt keeps running the old code. If the daemon is older than the binary, or the source checkout has newer commits than the binary, rebuild and re-run `daemon install` with the same `--config`, then `changathi skill install`. Ask first, because this restarts running work.
+
 ## Onboard a repository
 
 1. Read the repository and work out the commands that prove a change is good: build, tests, lint, vet. They must run unattended and fail loudly.
@@ -49,7 +54,7 @@ If the daemon isn't running, offer `changathi daemon install`: it sets the daemo
      verify: {provider: claude, model: claude-sonnet-5-5, effort: medium}
    ```
 
-   The verifier reviews each validated head read-only. Its blocking findings go back to the implementer, and its notes are posted on the PR as a review comment. Every role's provider and model must be on the daemon's `providers` allow-list (see `examples/config.yaml`); otherwise the project shows a workflow error and nothing dispatches. Ask the user before choosing models, since they decide the cost.
+   The verifier reviews each validated head read-only. Its blocking findings go back to the implementer, and its notes are posted on the PR as a review comment. Every role's provider and model must be on the daemon's `providers` allow-list (see `examples/config.yaml`); otherwise the project shows a workflow error and nothing dispatches. Ask the user before choosing models, since they decide the cost. Settle the provider before any issue is dispatched, because each attempt keeps the `WORKFLOW.md` it was first dispatched with. A later change to the base branch reaches an existing attempt only through `issue retry`, which re-reads it.
 
    The body is a Go `text/template` that receives `.Issue`. Keep it short, because Changathi already adds the issue text and delivery rules to the prompt.
 3. Register the repository:
@@ -116,7 +121,7 @@ changathi agent list --active                  # compact rows with the latest ve
 changathi agent show <id>                      # one agent: roles, latest verdict; no workflow or issue body (--full for all)
 changathi agent logs <id> --last               # the agent's last message and what followed
 changathi agent logs <id> --tail 20            # last 20 transcript items; --full adds tool output
-changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub
+changathi issue retry '<project>#<number>'     # rework: same as adding agent:rework on GitHub; re-reads WORKFLOW.md
 changathi issue cancel '<project>#<number>'    # stop the active attempt for an issue
 changathi project pause|resume <name>
 changathi usage                                # Codex account limits; Claude tokens and cost per model, last rate-limit window

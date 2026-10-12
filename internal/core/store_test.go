@@ -37,6 +37,7 @@ func TestConcurrentClaimsAndRecovery(t *testing.T) {
 		a.State = "needs_attention"
 		a.Workspace = filepath.Join(dir, "work")
 		a.Thread = "thread"
+		a.Workflow = Workflow{Revision: "old"}
 		return nil
 	})
 	retried, err := s.Enqueue(p, issue, "manual", true)
@@ -45,6 +46,9 @@ func TestConcurrentClaimsAndRecovery(t *testing.T) {
 	}
 	if retried.ID != a.ID || retried.Thread != "thread" {
 		t.Fatal("retry lost session/worktree")
+	}
+	if retried.Workflow.Revision != "" {
+		t.Fatal("retry kept the stale workflow snapshot")
 	}
 	_ = s.UpdateAttempt(a.ID, func(a *Attempt) error { a.State = "awaiting_review"; return nil })
 	same, _ := s.Enqueue(p, issue, "auto", false)
