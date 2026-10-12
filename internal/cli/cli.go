@@ -85,7 +85,7 @@ func (a *app) action(ctx context.Context, r service.Request) error {
 func (a *app) daemon() *cobra.Command {
 	cmd := &cobra.Command{Use: "daemon", Short: "Manage the daemon"}
 	start := &cobra.Command{Use: "start", Short: "Start the daemon in the foreground", RunE: func(c *cobra.Command, _ []string) error { return service.Serve(c.Context(), a.config) }}
-	start.Flags().IntVar(&a.config.Concurrency, "concurrency", 2, "Global agent limit")
+	start.Flags().IntVar(&a.config.Concurrency, "concurrency", 1, "Global agent limit")
 	start.Flags().IntVar(&a.config.PollSeconds, "poll-seconds", 30, "GitHub poll interval")
 	start.Flags().StringVar(&a.config.Codex, "codex", "codex", "Codex executable")
 	cmd.AddCommand(start, &cobra.Command{Use: "status", RunE: func(c *cobra.Command, _ []string) error {
