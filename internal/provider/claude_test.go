@@ -109,12 +109,12 @@ func TestClaudeVerifierPostureAndStructuredOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--permission-mode\ndontAsk", "--setting-sources\nuser", "--no-session-persistence", "--tools\nRead,Grep,Glob,Bash", "--json-schema"} {
+	for _, want := range []string{"--permission-mode\ndontAsk", "--setting-sources\nuser", "--no-session-persistence", "--tools\nRead,Grep,Glob,Bash", "Bash(git ls-files *)", "Bash(grep *)", "--json-schema"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("missing %q in args:\n%s", want, args)
 		}
 	}
-	if strings.Contains(args, "bypassPermissions") || strings.Contains(args, "--resume") {
+	if strings.Contains(args, "bypassPermissions") || strings.Contains(args, "--resume") || strings.Contains(args, "Bash(go ") || strings.Contains(args, "Bash(find ") {
 		t.Fatalf("verifier args too permissive:\n%s", args)
 	}
 	var final string

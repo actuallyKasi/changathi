@@ -207,7 +207,7 @@ flowchart LR
 
 ### Trust model
 
-Worktrees isolate Git changes, not processes. Implementing agents run unattended as the daemon's OS user (Codex with `approvalPolicy=never`, `sandbox=danger-full-access`; Claude with `--permission-mode bypassPermissions`), and validation commands run as that user too. Verifiers run read-only (Codex `sandbox=read-only`; Claude in `dontAsk` mode with only read and `git` inspection tools, and no project settings or hooks from the issue branch), and Changathi stops any attempt whose verifier changed the worktree anyway. Only register repositories whose code and workflow commands you trust. `WORKFLOW.md` is always read from the base branch, so an agent can't change its own policy by editing it. GitHub branch protection still applies; Changathi never bypasses required reviews.
+Worktrees isolate Git changes, not processes. Implementing agents run unattended as the daemon's OS user (Codex with `approvalPolicy=never`, `sandbox=danger-full-access`; Claude with `--permission-mode bypassPermissions`), and validation commands run as that user too. Verifiers run read-only (Codex `sandbox=read-only`; Claude in `dontAsk` mode with only read tools and an allowlist of read-only shell commands such as `git ls-files` and `grep`, and no project settings or hooks from the issue branch), and Changathi stops any attempt whose verifier changed the worktree anyway. Only register repositories whose code and workflow commands you trust. `WORKFLOW.md` is always read from the base branch, so an agent can't change its own policy by editing it. GitHub branch protection still applies; Changathi never bypasses required reviews.
 
 ## State and configuration
 

@@ -26,8 +26,22 @@ var ErrSessionLost = errors.New("provider session could not be resumed")
 // reads until that turn's result event.
 type Claude struct{ Command string }
 
+// VerifierCommands are the Bash commands a Claude verify session may run. Each
+// only reads; tools that can run other programs (find -exec, rg --pre, go,
+// make) are left out. Claude checks every part of a chained command separately.
+var VerifierCommands = []string{
+	"git diff", "git log", "git show", "git status", "git ls-files", "git check-ignore", "git grep", "git blame", "git rev-parse", "git cat-file",
+	"grep", "ls", "wc", "head", "tail",
+}
+
 // verifierTools is the read-only tool surface for a verify session.
-var verifierTools = []string{"Read", "Grep", "Glob", "Bash(git diff *)", "Bash(git log *)", "Bash(git show *)", "Bash(git status *)"}
+var verifierTools = func() []string {
+	tools := []string{"Read", "Grep", "Glob"}
+	for _, c := range VerifierCommands {
+		tools = append(tools, "Bash("+c+" *)")
+	}
+	return tools
+}()
 
 type claudeLine struct {
 	Type      string          `json:"type"`

@@ -224,7 +224,7 @@ func verifierPrompt(p core.Project, a core.Attempt, r core.Role, diff string) st
 	b.WriteString("Decide whether the change satisfies the issue's acceptance criteria and is correct. Report only concrete problems: a `blocking` finding must be a defect, a missing requirement, or a missing test for changed behavior; anything else is a `note`. Do not edit files or commit; you are read-only. Inspect the repository with the read-only tools if the diff is not enough.\n")
 	if r.Provider == "claude" {
 		// Matches provider.Claude's verifier allow-list; anything else is denied without a prompt.
-		b.WriteString("Your tools are Read, Grep and Glob, plus Bash for single `git diff`, `git log`, `git show` and `git status` commands only. Other commands, pipes and chained commands are denied. Changathi already ran the validation commands, so do not try to build or test; read files with Read rather than `cat`.\n")
+		b.WriteString("Your tools are Read, Grep and Glob, plus Bash for these read-only commands only: `" + strings.Join(provider.VerifierCommands, "`, `") + "`. Pipes and chains are allowed only when every part is on that list; anything else, including `go`, `make`, `npm` and other build or test tools, is denied and fails the whole command. Changathi already ran the validation commands, so do not build, test or run the program. Read files with Read rather than `cat`.\n")
 	}
 	if r.Instructions != "" {
 		b.WriteString("\nProject review instructions:\n")
