@@ -6,7 +6,7 @@ Implementation language: Go. Target platforms: macOS and Linux.
 
 ## 1. Purpose and scope
 
-Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands. The operator reviews results and asks for rework on GitHub (§7); there is no channel for messaging a running agent. The CLI is designed to be driven by a coding assistant (Claude) through a bundled skill, so its read commands return compact, bounded output.
+Changathi is a single-user service that executes GitHub issues across multiple repositories using coding agents. One daemon manages every registered project on its host. Each project corresponds to exactly one GitHub repository. A Go command-line client provides commands. The operator reviews results and asks for rework on GitHub (§7); there is no channel for messaging a running agent. The CLI is designed to be driven by a coding assistant (Claude Code) through a bundled skill, so its read commands return compact, bounded output; that operator assistant is independent of the provider that runs the agents.
 
 The initial provider is Codex. A provider adapter boundary permits a later Claude implementation without replacing scheduling, storage, GitHub integration, or the CLI. Claude execution was outside v1 and is now added by the extension in §15.
 
