@@ -138,12 +138,16 @@ func TestClaudeResumeAndFailures(t *testing.T) {
 		return p
 	}
 	limited := write("limited.jsonl",
-		`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day_opus"}}`,
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day_opus","resetsAt":1792170000}}`,
 		`{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"limit"}]},"error":"rate_limit"}`,
 		`{"type":"result","subtype":"success","is_error":true,"result":"You've hit your limit"}`)
 	_, args, err := runClaude(t, limited, Request{Model: "claude-opus-5-5", Thread: "11111111-1111-4111-8111-111111111111"})
 	if err == nil || !strings.Contains(err.Error(), "usage limit (seven_day_opus)") {
 		t.Fatalf("limit error %v", err)
+	}
+	var limit *LimitError
+	if !errors.As(err, &limit) || !limit.Resets.Equal(time.Unix(1792170000, 0)) {
+		t.Fatalf("limit reset %v", err)
 	}
 	if !strings.Contains(args, "--resume\n11111111-1111-4111-8111-111111111111") || strings.Contains(args, "--session-id") {
 		t.Fatalf("resume args:\n%s", args)

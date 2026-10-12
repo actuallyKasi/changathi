@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -70,6 +72,94 @@ func (e *Engine) setGate(r core.Role, msg string, until time.Time) {
 		}
 	}
 	_ = e.Store.Put("gate", core.GateKey(r.Provider, model), core.ProviderGate{Provider: r.Provider, Model: model, Until: until, Reason: msg})
+}
+
+// accountLimit reports whether err is a provider account or usage limit.
+func accountLimit(err error) bool {
+	var limit *provider.LimitError
+	if errors.As(err, &limit) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	for _, fragment := range []string{"rate limit", "usage limit", "ratelimit", "quota"} {
+		if strings.Contains(low, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	// limitBackoff gates a provider whose limit gives no reset time.
+	limitBackoff = 5 * time.Minute
+	// limitMargin waits past a stated reset so the first probe finds it lifted.
+	limitMargin = time.Minute
+	// limitHorizon bounds a stated reset; anything later is treated as unparsed.
+	limitHorizon = 8 * 24 * time.Hour
+)
+
+// limitUntil returns when to probe a limited provider again: the reset the
+// provider reported, else one named in the message, else a short backoff.
+func limitUntil(err error, now time.Time) time.Time {
+	var limit *provider.LimitError
+	if errors.As(err, &limit) && limit.Resets.After(now) && limit.Resets.Before(now.Add(limitHorizon)) {
+		return limit.Resets.Add(limitMargin)
+	}
+	if reset, ok := parseReset(err.Error(), now); ok {
+		return reset.Add(limitMargin)
+	}
+	return now.Add(limitBackoff)
+}
+
+// resetPattern matches reset times in limit messages, such as
+// "resets 6pm (Australia/Melbourne)", "resets Oct 14, 9:30am (UTC)" or
+// "will reset at 11pm".
+var resetPattern = regexp.MustCompile(`(?i)\b(?:resets?|try again)(?:\s+at)?\s+(?:([a-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([^)]+)\))?`)
+
+// parseReset reads a reset time from a limit message. A time without a date is
+// its next occurrence after now; a zone the host does not know falls back to local time.
+func parseReset(msg string, now time.Time) (time.Time, bool) {
+	m := resetPattern.FindStringSubmatch(msg)
+	if m == nil {
+		return time.Time{}, false
+	}
+	loc := time.Local
+	if m[6] != "" {
+		if l, err := time.LoadLocation(strings.TrimSpace(m[6])); err == nil {
+			loc = l
+		}
+	}
+	hour, _ := strconv.Atoi(m[3])
+	minute, _ := strconv.Atoi(m[4])
+	if hour < 1 || hour > 12 || minute > 59 {
+		return time.Time{}, false
+	}
+	hour %= 12
+	if strings.EqualFold(m[5], "pm") {
+		hour += 12
+	}
+	local := now.In(loc)
+	var reset time.Time
+	if m[1] != "" {
+		month, err := time.Parse("Jan", strings.ToUpper(m[1][:1])+strings.ToLower(m[1][1:]))
+		day, _ := strconv.Atoi(m[2])
+		if err != nil || day < 1 || day > 31 {
+			return time.Time{}, false
+		}
+		reset = time.Date(local.Year(), month.Month(), day, hour, minute, 0, 0, loc)
+		if reset.Before(now.Add(-24 * time.Hour)) {
+			reset = reset.AddDate(1, 0, 0)
+		}
+	} else {
+		reset = time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, loc)
+		if !reset.After(now) {
+			reset = reset.AddDate(0, 0, 1)
+		}
+	}
+	if !reset.After(now) || !reset.Before(now.Add(limitHorizon)) {
+		return time.Time{}, false
+	}
+	return reset, true
 }
 
 // recordUsage aggregates per-model token and cost totals reported by Claude turns.

@@ -371,8 +371,8 @@ func (e *Engine) fail(ctx context.Context, id string, err error) {
 		return
 	}
 	msg := err.Error()
-	if strings.Contains(strings.ToLower(msg), "rate limit") || strings.Contains(strings.ToLower(msg), "usage limit") || strings.Contains(strings.ToLower(msg), "ratelimit") || strings.Contains(strings.ToLower(msg), "quota") {
-		until := core.Now().Add(5 * time.Minute)
+	if accountLimit(err) {
+		until := limitUntil(err, core.Now())
 		role := core.Role{Provider: "codex"}
 		var re roleError
 		if errors.As(err, &re) {
@@ -585,6 +585,10 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 				}
 			}
 			if err != nil {
+				if accountLimit(err) {
+					// A limited turn did no work; give it back so waiting out the limit cannot exhaust max_turns.
+					_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Turns = turns; return nil })
+				}
 				e.fail(ctx, a.ID, roleError{impl, err})
 				return
 			}

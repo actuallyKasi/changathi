@@ -42,8 +42,9 @@ type claudeLine struct {
 	Usage     json.RawMessage `json:"usage"`
 	Structure json.RawMessage `json:"structured_output"`
 	RateLimit struct {
-		Status string `json:"status"`
-		Type   string `json:"rateLimitType"`
+		Status   string `json:"status"`
+		Type     string `json:"rateLimitType"`
+		ResetsAt int64  `json:"resetsAt"`
 	} `json:"rate_limit_info"`
 	Message struct {
 		ID      string `json:"id"`
@@ -76,6 +77,8 @@ type claudeSession struct {
 	model   string
 	turns   atomic.Int64
 	closed  atomic.Bool
+	// resets is when a rejected rate limit in the current turn lifts.
+	resets time.Time
 }
 
 func (c Claude) Open(context.Context) (Session, error) {
@@ -250,6 +253,7 @@ func (s *claudeSession) Run(ctx context.Context, prompt string, emit func(Event)
 	}
 	titles := map[string]string{}
 	var failure string
+	s.resets = time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -313,7 +317,7 @@ func (s *claudeSession) handle(v claudeLine, turn string, titles map[string]stri
 		var err error
 		if v.IsError || v.Subtype != "success" {
 			status = "failed"
-			err = claudeError(*failure, v.Subtype, v.Result)
+			err = claudeError(*failure, v.Subtype, v.Result, s.resets)
 			if v.Subtype == "error_during_execution" && s.sessionLost() {
 				err = fmt.Errorf("%w: %s", ErrSessionLost, s.session)
 			}
@@ -333,6 +337,9 @@ func (s *claudeSession) handle(v claudeLine, turn string, titles map[string]stri
 	case "rate_limit_event":
 		if v.RateLimit.Status == "rejected" {
 			*failure = "rate_limit:" + v.RateLimit.Type
+			if v.RateLimit.ResetsAt > 0 {
+				s.resets = time.Unix(v.RateLimit.ResetsAt, 0).UTC()
+			}
 		}
 		emit(Event{Type: "claude/rate_limit", Text: raw, Turn: turn})
 	}
@@ -340,7 +347,7 @@ func (s *claudeSession) handle(v claudeLine, turn string, titles map[string]stri
 }
 
 // claudeError maps CLI failures onto the engine's account-limit and attention paths.
-func claudeError(failure, subtype, result string) error {
+func claudeError(failure, subtype, result string, resets time.Time) error {
 	detail := strings.TrimSpace(result)
 	if detail == "" {
 		detail = subtype
@@ -348,10 +355,11 @@ func claudeError(failure, subtype, result string) error {
 	kind, window, _ := strings.Cut(failure, ":")
 	switch kind {
 	case "rate_limit", "billing_error":
+		err := fmt.Errorf("Claude usage limit: %s", detail)
 		if window != "" {
-			return fmt.Errorf("Claude usage limit (%s): %s", window, detail)
+			err = fmt.Errorf("Claude usage limit (%s): %s", window, detail)
 		}
-		return fmt.Errorf("Claude usage limit: %s", detail)
+		return &LimitError{Err: err, Resets: resets}
 	case "authentication_failed":
 		return fmt.Errorf("Claude authentication failed (run `claude auth login`): %s", detail)
 	}
@@ -405,7 +413,7 @@ func (c Claude) Probe(ctx context.Context, dir, model string) (string, error) {
 	var v claudeLine
 	if json.Unmarshal(out, &v) == nil && v.Type == "result" {
 		if v.IsError {
-			return "", claudeError("", v.Subtype, v.Result)
+			return "", claudeError("", v.Subtype, v.Result, time.Time{})
 		}
 		return "reachable", nil
 	}
