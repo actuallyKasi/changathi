@@ -18,7 +18,7 @@ changathi doctor            # git, gh, codex present and authenticated
 changathi summary           # fails with "cannot reach daemon" if it isn't running
 ```
 
-If the daemon isn't running, ask the user to start it (`changathi daemon start` runs in the foreground, or through its launchd/systemd unit). Don't start it yourself in a shell that will exit.
+If the daemon isn't running, offer `changathi daemon install`: it sets the daemon up as a launchd (macOS) or systemd (Linux) service, starts it and waits until it answers, and is safe to re-run. Ask before installing the service. Don't run `changathi daemon start` yourself in a shell that will exit.
 
 ## Onboard a repository
 

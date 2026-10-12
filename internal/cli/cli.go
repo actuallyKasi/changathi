@@ -32,6 +32,7 @@ func New() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.configFile, "config", "", "Service YAML configuration")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "Machine-readable JSON output")
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		a.out = cmd.OutOrStdout()
 		if a.configFile != "" {
 			b, err := os.ReadFile(a.configFile)
 			if err != nil {
@@ -88,7 +89,7 @@ func (a *app) daemon() *cobra.Command {
 	start.Flags().IntVar(&a.config.Concurrency, "concurrency", 1, "Global agent limit")
 	start.Flags().IntVar(&a.config.PollSeconds, "poll-seconds", 30, "GitHub poll interval")
 	start.Flags().StringVar(&a.config.Codex, "codex", "codex", "Codex executable")
-	cmd.AddCommand(start, &cobra.Command{Use: "status", RunE: func(c *cobra.Command, _ []string) error {
+	cmd.AddCommand(start, a.daemonInstall(), a.daemonUninstall(), &cobra.Command{Use: "status", RunE: func(c *cobra.Command, _ []string) error {
 		s, e := a.client().Status(c.Context())
 		if e != nil {
 			return e

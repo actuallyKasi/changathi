@@ -35,31 +35,19 @@ Because `~/.local/bin/changathi` is a symlink, later rebuilds update it in place
 
 ### 3. Run the daemon as a service
 
-The daemon runs in the foreground, so let the OS supervise it.
-
-**macOS (launchd).** The template in `packaging/` uses `/Users/you`; replace it with your home directory and load it:
-
 ```sh
-sed "s|/Users/you|$HOME|g" packaging/dev.changathi.plist > ~/Library/LaunchAgents/dev.changathi.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.changathi.plist
-changathi summary                            # answers once the daemon is up
+changathi daemon install                     # writes the service, starts it, waits until the daemon answers
 ```
 
-The plist's `PATH` must reach `git`, `gh` and `codex`; add their directories if they live somewhere other than Homebrew or `/usr/local/bin`. Logs go to `~/Library/Logs/changathi.log` and `changathi.error.log`.
+On macOS this writes the launchd agent `~/Library/LaunchAgents/dev.changathi.plist` and loads it; on Linux it writes the systemd user unit `~/.config/systemd/user/changathi.service` and enables it. The service runs the `changathi` on your PATH, and its `PATH` covers `git`, `gh`, `codex` and the rest of your current shell's `PATH`, so validation commands find the same tools as your terminal. Run install from a shell where those resolve.
+
+It is safe to re-run: if nothing changed it leaves the running daemon alone, otherwise it rewrites the file and restarts the service. Use `--print` to see the file without installing it, and `changathi daemon uninstall` to stop and remove the service (state in the data directory is kept). Logs go to `~/Library/Logs/changathi.log` and `changathi.error.log` on macOS and to `journalctl --user -u changathi` on Linux.
 
 After rebuilding, restart it so it loads the new binary:
 
 ```sh
-make build && launchctl kickstart -k gui/$(id -u)/dev.changathi
-```
-
-**Linux (systemd user unit).**
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp packaging/changathi.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now changathi
+make build && launchctl kickstart -k gui/$(id -u)/dev.changathi   # macOS
+make build && systemctl --user restart changathi                 # Linux
 ```
 
 For a quick try without a service, run `changathi daemon start` in a terminal and leave it open.

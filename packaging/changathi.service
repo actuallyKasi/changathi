@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/changathi daemon start
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart={{systemdArgs .Args}}
+Environment={{systemdQuote (printf "PATH=%s" .Path)}}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
