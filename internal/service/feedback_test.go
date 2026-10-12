@@ -188,3 +188,169 @@ func TestReworkLabelStartsNewGenerationWithOperatorComments(t *testing.T) {
 		t.Fatalf("same-generation rework: state=%s feedback=%q", again.State, again.Feedback)
 	}
 }
+
+func TestParseReply(t *testing.T) {
+	for _, c := range []struct{ text, want string }{
+		{"Answer below.\n```changathi-reply\nNo, the free plan allows 5 calls a minute.\n```\n", "No, the free plan allows 5 calls a minute."},
+		{"````changathi-reply\nUse:\n```go\nx := 1\n```\nDone.\n````", "Use:\n```go\nx := 1\n```\nDone."},
+		{"```changathi-reply\nfirst\n```\nthen\n```changathi-reply\nsecond\n```", "second"},
+		{"I mention changathi-reply in prose only.", ""},
+		{"```changathi-reply\n\n```", ""},
+		{"```changathi-reply\nunterminated", ""},
+	} {
+		got, ok := parseReply(c.text)
+		if got != c.want || ok != (c.want != "") {
+			t.Errorf("parseReply(%q) = %q, %v; want %q", c.text, got, ok, c.want)
+		}
+	}
+}
+
+// reworkWithQuestion delivers generation 1, then asks a question with
+// agent:rework and returns the queued generation 2.
+func reworkWithQuestion(t *testing.T, prov *fakeProvider) (*Engine, *feedbackGH, core.Project, core.Attempt, core.Attempt) {
+	t.Helper()
+	e, base, ps := setup(t, 1, prov)
+	g := &feedbackGH{fakeGH: base}
+	e.GitHub = g
+	ctx := context.Background()
+	p := ps[0]
+	first, err := e.Store.Enqueue(p, base.issues[p.ID], "auto", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.execute(ctx, p, first)
+	if first, _ = e.current(first.ID); first.State != "awaiting_review" || first.PR != 1 {
+		t.Fatalf("first generation: state=%s pr=%d error=%s", first.State, first.PR, first.Error)
+	}
+	g.comment("operator", "User", "Do we need to consider any rate limits from the new API?", first.Created.Add(time.Second))
+	g.label(p, core.ReworkLabel)
+	e.poll(ctx)
+	as, _ := core.List[core.Attempt](e.Store, "attempt")
+	second := latestAttempt(as, p.ID, first.Issue.ID)
+	if second == nil || second.Generation != 2 || second.State != "queued" {
+		t.Fatalf("rework generation: %+v", second)
+	}
+	return e, g, p, first, *second
+}
+
+// A question answered without code returns the issue to review: the reply is
+// posted on the issue and recorded, with no validation retry and no new PR.
+func TestReworkReplyWithoutChangeReturnsToReview(t *testing.T) {
+	prov := &fakeProvider{}
+	e, g, p, first, second := reworkWithQuestion(t, prov)
+	prov.reply = "Checked the client.\n```changathi-reply\nNo: each run makes at most 2 calls, well under the 5-per-minute limit.\n```"
+	prov.noCommit = true
+	before := len(prov.prompts)
+	ctx := context.Background()
+	e.execute(ctx, p, second)
+	got, _ := e.current(second.ID)
+	if got.State != "awaiting_review" || got.Error != "" {
+		t.Fatalf("state=%s error=%s", got.State, got.Error)
+	}
+	if got.PR != first.PR || got.Head != first.Head || got.BaseSHA != first.BaseSHA || got.Turns != 1 {
+		t.Fatalf("answered generation should carry the merged delivery after one turn: %+v", got)
+	}
+	if !strings.Contains(got.Reply, "5-per-minute") || strings.Contains(got.Reply, "Checked the client") {
+		t.Fatalf("reply: %q", got.Reply)
+	}
+	if n := len(prov.prompts) - before; n != 1 {
+		t.Fatalf("%d implement turns, want 1 (no forced commit turn)", n)
+	}
+	if prompt := prov.prompts[before]; !strings.Contains(prompt, "changathi-reply") || !strings.Contains(prompt, "rate limits") {
+		t.Fatalf("rework prompt lacks reply instructions:\n%s", prompt)
+	}
+	if g.creates != 1 || g.merges != 1 {
+		t.Fatalf("answer opened or merged a PR: creates=%d merges=%d", g.creates, g.merges)
+	}
+	var posted string
+	for key, body := range g.status {
+		if strings.HasPrefix(key, second.ID+"-reply-") {
+			posted = body
+		}
+	}
+	if !strings.Contains(posted, "5-per-minute") || !strings.Contains(posted, "PR #1") || !strings.Contains(posted, core.ReworkLabel) {
+		t.Fatalf("reply comment: %q (all: %v)", posted, g.status)
+	}
+	if i, _ := g.Issue(ctx, p, 1); !hasLabel(i, "agent:review") {
+		t.Fatalf("agent:review not restored: %+v", i.Labels)
+	}
+	writes := g.writes
+	e.poll(ctx)
+	if g.writes != writes {
+		t.Fatal("reply comment reposted on the next poll")
+	}
+	events, _ := e.Store.Events(0, 1000)
+	recorded := false
+	for _, v := range events {
+		if v.AttemptID == second.ID && v.Type == "reply" && strings.Contains(v.Text, "5-per-minute") {
+			recorded = true
+		}
+		if v.AttemptID == second.ID && (v.Type == "validation" || v.Type == "verification") {
+			t.Fatalf("answer ran %s", v.Type)
+		}
+	}
+	if !recorded {
+		t.Fatal("reply missing from the transcript")
+	}
+	// Closing the issue completes the review as usual.
+	g.mu.Lock()
+	i := g.issues[p.ID]
+	i.State = "closed"
+	g.issues[p.ID] = i
+	g.mu.Unlock()
+	e.poll(ctx)
+	if got, _ = e.current(second.ID); got.State != "done" {
+		t.Fatalf("closed issue left answered generation %s", got.State)
+	}
+}
+
+// A turn that changes code is delivered as usual even when it also replies.
+func TestReworkReplyWithChangeIsDelivered(t *testing.T) {
+	prov := &fakeProvider{}
+	e, g, p, _, second := reworkWithQuestion(t, prov)
+	prov.reply = "```changathi-reply\nAdded handling.\n```"
+	e.execute(context.Background(), p, second)
+	got, _ := e.current(second.ID)
+	if got.State != "awaiting_review" || got.Reply != "" || got.PR != 2 || g.creates != 2 {
+		t.Fatalf("state=%s reply=%q pr=%d creates=%d error=%s", got.State, got.Reply, got.PR, g.creates, got.Error)
+	}
+}
+
+// With no merged generation to return to, a reply leaves the attempt for the
+// operator instead of claiming a delivery.
+func TestReworkReplyWithoutDeliveryNeedsAttention(t *testing.T) {
+	prov := &fakeProvider{noCommit: true}
+	e, base, ps := setup(t, 1, prov)
+	g := &feedbackGH{fakeGH: base}
+	e.GitHub = g
+	ctx := context.Background()
+	p := ps[0]
+	a, err := e.Store.Enqueue(p, base.issues[p.ID], "auto", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.execute(ctx, p, a)
+	if a, _ = e.current(a.ID); a.State != "needs_attention" {
+		t.Fatalf("state=%s", a.State)
+	}
+	g.comment("operator", "User", "Why is nothing committed?", a.Created.Add(time.Second))
+	g.label(p, core.ReworkLabel)
+	e.poll(ctx)
+	if a, _ = e.current(a.ID); a.State != "queued" || a.Feedback == "" {
+		t.Fatalf("same-generation rework: state=%s feedback=%q", a.State, a.Feedback)
+	}
+	prov.reply = "```changathi-reply\nThe issue is already satisfied by main.\n```"
+	turns := len(prov.prompts)
+	e.execute(ctx, p, a)
+	got, _ := e.current(a.ID)
+	if got.State != "needs_attention" || got.PR != 0 || !strings.Contains(got.Reply, "already satisfied") || len(prov.prompts)-turns != 1 || g.creates != 0 {
+		t.Fatalf("state=%s pr=%d reply=%q turns=%d creates=%d", got.State, got.PR, got.Reply, len(prov.prompts)-turns, g.creates)
+	}
+	found := false
+	for key, body := range g.status {
+		found = found || (strings.HasPrefix(key, a.ID+"-reply-") && strings.Contains(body, "already satisfied") && strings.Contains(body, "undelivered"))
+	}
+	if !found {
+		t.Fatalf("reply comment missing: %v", g.status)
+	}
+}

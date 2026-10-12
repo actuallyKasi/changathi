@@ -62,6 +62,99 @@ func (e *Engine) rework(ctx context.Context, p core.Project, i core.Issue, trigg
 	return a, nil
 }
 
+// replyInstructions tells a rework agent how to answer a question without
+// changing code. Without it, the no-commit validation check pushes the agent to
+// invent a change.
+const replyInstructions = "Some comments only ask a question, or need no code change once you have checked. In that case do not edit or commit anything just to give Changathi a commit. Leave the branch as it is and end your final message with exactly one fenced block holding your answer for the operator. Changathi posts it on the issue and returns the issue to review, with no validation and no PR:\n````changathi-reply\nYour answer, in Markdown.\n````\nIf the comments ask for changes, implement and commit them as usual and leave that block out. A turn that changes the branch is validated and delivered as usual, even if it includes the block."
+
+// parseReply extracts the last changathi-reply block from an agent message.
+// The closing fence is the last line made of the opening fence, so the answer
+// may contain shorter code fences of its own.
+func parseReply(text string) (string, bool) {
+	at := strings.LastIndex(text, "changathi-reply")
+	if at < 3 {
+		return "", false
+	}
+	start := at
+	for start > 0 && text[start-1] == '`' {
+		start--
+	}
+	fence := text[start:at]
+	if len(fence) < 3 || (start > 0 && text[start-1] != '\n') {
+		return "", false
+	}
+	rest := text[at+len("changathi-reply"):]
+	nl := strings.IndexByte(rest, '\n')
+	if nl < 0 || strings.TrimSpace(rest[:nl]) != "" {
+		return "", false
+	}
+	body := rest[nl+1:]
+	end, off := -1, 0
+	for _, line := range strings.SplitAfter(body, "\n") {
+		if strings.TrimSpace(line) == fence {
+			end = off
+		}
+		off += len(line)
+	}
+	if end < 0 {
+		return "", false
+	}
+	reply := strings.TrimSpace(body[:end])
+	return reply, reply != ""
+}
+
+// worktreeState is HEAD plus uncommitted changes, or "" when git fails, so a
+// reply is accepted only from a turn that left the branch untouched.
+func worktreeState(ctx context.Context, path string) string {
+	head, err := core.Command(ctx, path, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return ""
+	}
+	status, err := core.Command(ctx, path, "git", "status", "--porcelain")
+	if err != nil {
+		return ""
+	}
+	return head + "\n" + status
+}
+
+// answer ends a rework turn that replied to the operator without changing
+// code. The reply goes to the transcript and the issue. An attempt that holds
+// no work of its own returns to review of the merged generation before it;
+// otherwise its undelivered work needs the operator again. Nothing is
+// validated, verified or opened as a PR.
+func (e *Engine) answer(ctx context.Context, p core.Project, a core.Attempt, reply string) {
+	e.event(a.ID, "reply", reply)
+	var prev *core.Attempt
+	ahead, err := core.Command(ctx, a.Workspace, "git", "rev-list", "--count", "origin/"+p.Base+"..HEAD")
+	if err == nil && ahead == "0" && a.PR == 0 && a.Previous != nil && a.Previous.PR != 0 {
+		as, _ := core.List[core.Attempt](e.Store, "attempt")
+		for _, x := range as {
+			if x.ProjectID == a.ProjectID && x.Issue.ID == a.Issue.ID && x.Generation == a.Previous.Generation && x.PR != 0 && (x.State == "awaiting_review" || x.State == "done" || x.State == "superseded") {
+				copy := x
+				prev = &copy
+			}
+		}
+	}
+	_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error {
+		x.Reply, x.NextStep = reply, ""
+		if prev != nil {
+			// The merged generation stays the delivery under review, so the
+			// supervisor's evidence gate still finds its head.
+			x.PR, x.Head, x.BaseSHA = prev.PR, prev.Head, prev.BaseSHA
+		}
+		return nil
+	})
+	if prev != nil {
+		if err := e.GitHub.MarkReview(ctx, p, a.Issue.Number); err != nil {
+			e.event(a.ID, "reply", "restoring agent:review failed: "+err.Error())
+		}
+		e.state(a.ID, "awaiting_review", "")
+	} else {
+		e.state(a.ID, "needs_attention", "the agent answered the operator's comments without changing code; this generation's work is still undelivered")
+	}
+	e.publishStatus(ctx)
+}
+
 // pollRework honours agent:rework on a project's open issues. A request made
 // while the issue's attempt is still working takes effect once it stops.
 func (e *Engine) pollRework(ctx context.Context, p core.Project) {
@@ -146,7 +239,12 @@ func (e *Engine) publishStatus(ctx context.Context) {
 		if a.StatusPosted == sum {
 			continue
 		}
-		if err := g.StatusComment(ctx, p, a.Issue.Number, a.ID, body); err != nil {
+		// Each reply is its own comment, so a later one never erases an earlier answer.
+		key := a.ID
+		if a.Reply != "" {
+			key += "-reply-" + sum[:12]
+		}
+		if err := g.StatusComment(ctx, p, a.Issue.Number, key, body); err != nil {
 			_ = e.Store.Event(a.ID, "status_comment", "posting status comment failed: "+err.Error())
 			continue
 		}
@@ -162,6 +260,18 @@ func (e *Engine) publishStatus(ctx context.Context) {
 func statusBody(a core.Attempt, operator string, parent int) string {
 	var b strings.Builder
 	feedback := fmt.Sprintf("only comments by @%s reach the agent", operator)
+	if a.Reply != "" {
+		fmt.Fprintf(&b, "### Changathi agent reply\n\nGeneration %d answered your comments without changing code.\n\n", a.Generation)
+		b.WriteString(a.Reply)
+		b.WriteString("\n\n---\n\n")
+		if a.State == "awaiting_review" {
+			fmt.Fprintf(&b, "**Next step:** PR #%d is still the delivered work under review. Close this issue as completed if it meets the acceptance criteria. ", a.PR)
+		} else {
+			b.WriteString("**Next step:** this generation's work is still undelivered. ")
+		}
+		fmt.Fprintf(&b, "If you want changes, comment with what (%s), then add the `%s` label. A question that needs no code change doesn't need the label; ask it in your Changathi operator session instead.", feedback, core.ReworkLabel)
+		return b.String()
+	}
 	switch a.State {
 	case "needs_attention":
 		b.WriteString("### Changathi needs attention\n\n")

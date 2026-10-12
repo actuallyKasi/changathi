@@ -187,6 +187,7 @@ You never need to message an agent. Everything happens on the issue:
 | --- | --- | --- |
 | It stopped (`needs_attention`) | Comment with guidance if the agent can fix it (or fix the outside cause yourself), then add `agent:rework` | Re-runs the same branch and PR with your comments and the last failure in the prompt |
 | It merged but misses the acceptance criteria | Leave the issue open, comment what's missing, add `agent:rework` | Starts a new generation (new branch and PR) that knows the previous PR and your comments |
+| You have a question, not a change request | Ask it in your Claude Code session; `agent:rework` isn't needed | Nothing. If you do add `agent:rework`, the agent posts its answer as an issue comment and the issue goes back to review with no new PR |
 | It's done, but you spotted a separate bug or idea | Close it as completed; open a new issue that links back | Treats the new issue like any other |
 
 Only your own comments (the `gh` login Changathi runs as) are passed to the agent; comments from anyone else are ignored. `changathi issue retry` does the same as the label from the CLI. For supervisor children, rework before you close the child: its dependants wait for the new delivery.

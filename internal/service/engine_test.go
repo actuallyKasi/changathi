@@ -86,6 +86,11 @@ func (g *fakeGH) Prepare(context.Context, core.Project) ([]string, error) {
 type fakeProvider struct {
 	block   <-chan struct{}
 	entered chan string
+	// reply is the agent's final message; noCommit leaves the branch untouched.
+	reply    string
+	noCommit bool
+	mu       sync.Mutex
+	prompts  []string
 }
 type fakeSession struct {
 	workspace string
@@ -99,7 +104,10 @@ func (s *fakeSession) Start(_ context.Context, r provider.Request) error {
 	s.workspace = r.Workspace
 	return nil
 }
-func (s *fakeSession) Run(ctx context.Context, _ string, emit func(provider.Event)) error {
+func (s *fakeSession) Run(ctx context.Context, prompt string, emit func(provider.Event)) error {
+	s.p.mu.Lock()
+	s.p.prompts = append(s.p.prompts, prompt)
+	s.p.mu.Unlock()
 	emit(provider.Event{Type: "session_started", Thread: "fake-thread", Turn: "fake-turn"})
 	if s.p.entered != nil {
 		s.p.entered <- s.workspace
@@ -110,6 +118,12 @@ func (s *fakeSession) Run(ctx context.Context, _ string, emit func(provider.Even
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if s.p.reply != "" {
+		emit(provider.Event{Type: "item/completed", Turn: "fake-turn", Output: &core.Output{Kind: "assistant", ItemID: "msg", Mode: "snapshot", Status: "completed", Text: s.p.reply}})
+	}
+	if s.p.noCommit {
+		return nil
 	}
 	if e := os.WriteFile(filepath.Join(s.workspace, "feature.txt"), []byte("feature\n"), 0600); e != nil {
 		return e

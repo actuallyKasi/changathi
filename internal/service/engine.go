@@ -549,9 +549,18 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 				}
 			}
 			e.state(a.ID, "running", "")
-			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Turns = turns + 1; x.NextStep = ""; return nil })
+			_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error { x.Turns = turns + 1; x.NextStep = ""; x.Reply = ""; return nil })
+			before := worktreeState(ctx, path)
+			var final string
+			var said []string
 			run := func(prompt string) error {
+				final, said = "", nil
 				return s.Run(ctx, prompt, func(v provider.Event) {
+					if v.Type == "claude/result" {
+						final = v.Text
+					} else if v.Output != nil && v.Output.Kind == "assistant" && v.Output.Mode == "snapshot" && v.Output.Text != "" {
+						said = append(said, v.Output.Text)
+					}
 					if v.Thread != "" {
 						threadID = v.Thread
 						_ = e.Store.UpdateAttempt(a.ID, func(x *core.Attempt) error {
@@ -579,6 +588,20 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 				e.fail(ctx, a.ID, roleError{impl, err})
 				return
 			}
+			// A rework turn may answer the operator instead of changing code.
+			if a.Feedback != "" {
+				reply, ok := parseReply(final)
+				if !ok {
+					reply, ok = parseReply(strings.Join(said, "\n"))
+				}
+				if ok {
+					if after := worktreeState(ctx, path); after != "" && after == before {
+						e.answer(ctx, p, a, reply)
+						return
+					}
+					e.event(a.ID, "reply", "ignoring the changathi-reply block because the turn changed the branch or worktree; validating the change instead")
+				}
+			}
 			// The turn is complete: an interruption from here on resumes at validation.
 			setStep("validate", "")
 		}
@@ -586,6 +609,9 @@ func (e *Engine) execute(ctx context.Context, p core.Project, a core.Attempt) {
 		head, base, validationErr := e.validate(ctx, p, a)
 		if validationErr != nil {
 			prompt = "Validation failed. Fix the problem and commit the correction:\n" + validationErr.Error()
+			if errors.Is(validationErr, errNoCommits) && a.Feedback != "" {
+				prompt += "\n\nIf the operator's comments need no code change, do not make one to satisfy this check. Leave the branch as it is and end your reply with a changathi-reply block holding your answer, as described earlier."
+			}
 			setStep("", prompt)
 			continue
 		}
@@ -684,6 +710,7 @@ func implementPrompt(p core.Project, a core.Attempt, flow core.Workflow) (string
 	}
 	if a.Feedback != "" {
 		prompt += "\n\n" + a.Feedback
+		prompt += "\n\n" + replyInstructions
 	}
 	if a.LastFailure != "" {
 		prompt += "\n\nThe last failure on this branch, still to be fixed:\n" + a.LastFailure
@@ -766,6 +793,8 @@ func (e *Engine) recordEvent(event core.Event) {
 	}
 }
 
+var errNoCommits = errors.New("agent made no commits")
+
 var closing = regexp.MustCompile(`(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+(#[0-9]+|[a-z0-9_.-]+/[a-z0-9_.-]+#[0-9]+|https://github\.com/\S+/issues/[0-9]+)`)
 
 func (e *Engine) validate(ctx context.Context, p core.Project, a core.Attempt) (string, string, error) {
@@ -802,7 +831,7 @@ func (e *Engine) validate(ctx context.Context, p core.Project, a core.Attempt) (
 		return "", "", err
 	}
 	if count == "0" {
-		return "", "", errors.New("agent made no commits")
+		return "", "", errNoCommits
 	}
 	head, err := core.Command(ctx, a.Workspace, "git", "rev-parse", "HEAD")
 	return head, base, err
