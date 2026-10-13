@@ -166,6 +166,8 @@ func (s *codexSession) Start(ctx context.Context, r Request) error {
 	if r.Thread != "" {
 		method = "thread/resume"
 		params["threadId"] = r.Thread
+		// Turns run on the server-side thread; hydrating its history is unused and deprecated.
+		params["excludeTurns"] = true
 	}
 	b, e := s.call(ctx, method, params)
 	if e != nil {
