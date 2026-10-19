@@ -205,15 +205,15 @@ Only your own comments (the `gh` login Changathi runs as) are passed to the agen
 
 ### Dependent issues
 
-A parent issue labelled `supervisor` holds a plan: which child issues to run and what each depends on. The supervisor dispatches a child once its prerequisites are merged **and** closed by you, so nothing builds on unreviewed work. See [examples/supervisor-issue.md](examples/supervisor-issue.md) for a plan and [SUPERVISOR_SPEC.md](SUPERVISOR_SPEC.md) for the full rules, including evidence approval for operational tasks.
+A parent issue labelled `supervisor` coordinates its **sub-issues**. Each child's GitHub **blocked by** links are its dependencies, so the plan lives in GitHub's own issue relationships and you edit it there; Changathi re-reads it on every poll. The supervisor dispatches a child once its blockers are merged **and** closed by you, so nothing builds on unreviewed work. Closing a child as completed is the only approval. A child labelled `changathi:evidence` must also deliver operational evidence (a report under `docs/validation/` or an `Evidence: https://…` line in its PR); `changathi:manual` makes a child a manual gate with no agent. See [examples/supervisor-issue.md](examples/supervisor-issue.md) and [SUPERVISOR_SPEC.md](SUPERVISOR_SPEC.md) for the full rules.
 
 ```mermaid
 flowchart LR
-    p["Parent issue<br/>label: supervisor"] -.plan.-> c1["#3 schema"]
-    p -.plan.-> c2["#4 API"]
-    p -.plan.-> c3["#5 UI"]
-    c1 -- "merged + closed" --> c2
-    c2 -- "merged + closed" --> c3
+    p["Parent issue<br/>label: supervisor"] -.sub-issue.-> c1["#3 schema"]
+    p -.sub-issue.-> c2["#4 API"]
+    p -.sub-issue.-> c3["#5 UI"]
+    c1 -- "blocks · merged + closed" --> c2
+    c2 -- "blocks · merged + closed" --> c3
 ```
 
 ### Trust model

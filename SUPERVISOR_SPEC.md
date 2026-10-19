@@ -1,10 +1,10 @@
 # Changathi supervisor implementation specification
 
-Status: deterministic supervisor implemented, 2026-10-08; optional advisory agent deferred. This document extends [SPEC.md](SPEC.md). MUST denotes a requirement; SHOULD denotes a recommendation. CLI commands and configuration below describe the implemented interface; implementation notes qualify the original design.
+Status: deterministic supervisor implemented, 2026-10-08; plans from GitHub sub-issues and closure-only approval, 2026-10-19; optional advisory agent deferred. This document extends [SPEC.md](SPEC.md). MUST denotes a requirement; SHOULD denotes a recommendation. CLI commands and configuration below describe the implemented interface; implementation notes qualify the original design.
 
 ## 1. Purpose
 
-Coordinate a set of dependent GitHub issues through a parent issue labelled `supervisor`. Changathi selects eligible children, runs them through its existing delivery pipeline, and waits for human completion of prerequisites before advancing. A parent contains the scope, ordered dependency graph, and completion requirements.
+Coordinate a set of dependent GitHub issues through a parent issue labelled `supervisor`. Changathi selects eligible children, runs them through its existing delivery pipeline, and waits for human completion of prerequisites before advancing. The parent states the goal; the graph is GitHub's own issue relationships: the parent's sub-issues are the children and each child's blocked-by links are its dependencies.
 
 The initial target is the homelab sequence: configuration decisions (#3), node preparation (#4), kubeadm/Cilium bootstrap (#5), cluster validation (#6), Argo CD (#7), ARC/CI (#8), and deployment/rollback validation (#9).
 
@@ -22,54 +22,29 @@ Starting a plan does not supply missing credentials or override restrictions on 
 
 ## 3. Parent issue contract
 
-An open parent MUST carry `supervisor` and exactly one fenced block whose language is `changathi-supervisor`. Narrative outside the block explains the goal; it is not parsed for dispatch decisions. Checkboxes and free-form dependency comments are display information only.
+An open parent MUST carry `supervisor`. Its body explains the goal and is not parsed. The plan is derived from GitHub on every reconciliation:
 
-Example parent body for homelab (the parent itself is a separate issue):
+- **Children** are the parent's sub-issues (`GET /repos/{repo}/issues/{parent}/sub_issues`), in GitHub's sub-issue order.
+- **Dependencies** are each child's blocked-by issues (`GET /repos/{repo}/issues/{child}/dependencies/blocked_by`).
+- **Policy** comes from child labels. `changathi:evidence` sets `requires_evidence` (§5). `changathi:manual` sets `completion: closed_completed`: a manual gate that queues no implementation worker and still requires human completion. Without it, `completion` is `merged_and_closed`. `project add` creates both labels.
 
-````markdown
-Bring the homelab from its verified VM baseline to a tested GitOps delivery path.
+Example for homelab: label the parent `supervisor`; add #3–#9 as its sub-issues; mark #4 blocked by #3, #5 by #4, and so on to #9 by #8; label #4–#9 `changathi:evidence`. See [examples/supervisor-issue.md](examples/supervisor-issue.md).
 
-```changathi-supervisor
-version: 1
-children:
-  - issue: 3
-    depends_on: []
-    completion: merged_and_closed
-  - issue: 4
-    depends_on: [3]
-    completion: merged_and_closed
-  - issue: 5
-    depends_on: [4]
-    completion: merged_and_closed
-  - issue: 6
-    depends_on: [5]
-    completion: merged_and_closed
-  - issue: 7
-    depends_on: [6]
-    completion: merged_and_closed
-  - issue: 8
-    depends_on: [7]
-    completion: merged_and_closed
-  - issue: 9
-    depends_on: [8]
-    completion: merged_and_closed
-```
-````
+Validation rejects: no sub-issues, sub-issues from another repository, pull requests, children labelled `supervisor`, the parent as a child, duplicates, cycles, more than 100 children or 500 edges, and any blocker that is not itself a sub-issue of the same parent. The last rule keeps the graph closed: a plan never silently waits on, or ignores, an issue outside it. Dependencies are sorted, so blocker order on GitHub does not change the plan. Resolve immutable issue IDs before enrollment; surface errors without partial scheduling.
 
-All references are issue numbers in the registered repository. `completion` defaults to `merged_and_closed`. `closed_completed` is a manual completion gate for work that needs no code delivery; it queues no implementation worker and still requires human completion. A documentation/report PR may use the default.
+Sub-issue order breaks ties between eligible children. A child without blockers is eligible immediately, subject to all other gates. Never infer an edge from prose or numeric issue order.
 
-Parse with a strict versioned schema. Reject unknown fields, empty graphs, duplicate children, missing dependencies, cycles, self-reference, the parent as a child, PR numbers, and children labelled `supervisor`. Resolve repository/issue immutable IDs before enrollment. Proposed limits: 100 children and 500 edges per plan; surface limit errors without partial scheduling.
-
-List order breaks ties between eligible children. An empty dependency list permits immediate eligibility, subject to all other gates. Never infer an edge from prose or numeric issue order.
+**Deprecated fenced plan.** A parent whose body contains a ```` ```changathi-supervisor ```` block keeps using it, so plans enrolled before 2026-10-19 work unchanged. The block is strict versioned YAML (`version: 1`, `children` with `issue`, `depends_on`, `completion`, `requires_evidence`); unknown fields, a second block or document, and the same graph errors as above are rejected. The plan's source is part of its revision, so moving a plan from the body to sub-issues is an ordinary graph change (§4): remove the block and the next pass adopts the sub-issues, subject to the same safety rules. The workpad marks a fenced plan as deprecated.
 
 ## 4. Activation and plan revisions
 
 - In an enabled project with `auto: true`, discover open `supervisor` issues through paginated polling. A valid new plan is enrolled and activated. The parent does not need `agent:ready`.
-- In a project with `auto: false`, `supervisor start <project>#<parent>` validates, enrolls, and activates it explicitly. The `supervisor` label is still required.
+- In a project with `auto: false`, `supervisor start <project>#<parent>` validates, enrolls, and activates it explicitly. The `supervisor` label is still required. `start` also restarts a cancelled or finished plan.
 - A parent MUST never enter the ordinary implementation queue, even if it also carries `agent:ready`. Ordinary `issue run` on a parent returns an instruction to use `supervisor start`.
-- Snapshot the canonical graph, its hash, the source body/update time, and activation origin. Each dispatch records the plan revision that authorized it.
-- A changed parent body requires validation. If only narrative changed and the canonical graph is identical, update the display snapshot. A graph change puts the plan into `needs_attention`; preview it with `supervisor reload`, then adopt it with `supervisor reload --apply`. Reload leaves the plan paused until resume.
-- Reload cannot remove or transfer a child with active execution, invalidate completed prerequisites silently, or change completion policy for already accepted work without explicit reconciliation. Refuse unsafe edits with a precise reason.
+- Snapshot the canonical graph and its hash (the revision) with its source and activation origin. Each dispatch records the revision that authorized it, for audit.
+- The graph is re-read on every pass; there is no reload command. A changed revision is adopted automatically, in one enrollment transaction, unless it would orphan or re-gate work in flight. These changes are refused: removing a dispatched child, changing a dispatched child's completion policy, adding a blocker to a dispatched child that is not done, and adding a child owned by another plan or with a conflicting attempt. A refused or invalid graph holds the plan in `needs_attention` with a `plan change rejected:` reason and stops its workers at the next boundary. The hold is re-evaluated every pass, so undoing the edit on GitHub releases it without an operator command. Removing a blocker, adding an undispatched child, or reordering takes effect at once.
+- A failure to read the graph (API outage, rate limit) is a remote wait (`waiting_remote`, §8), never a plan hold.
+- Adopting a revision releases ownership only of removed children that were never dispatched. A running child keeps its attempt; the gate checks it against the current graph, not the revision it was dispatched under.
 - Pausing/removing the label/closing the parent does not erase its enrollment or ownership records. Re-adding a label must not undo an explicit operator pause/cancel. Resume requires an explicit command.
 
 Plan enrollment is serialized with normal enqueue operations. Do not adopt a child that already has a conflicting active or awaiting-review attempt: report the conflict and require operator reconciliation. Previously completed external work may be accepted under the evidence rules below.
@@ -82,9 +57,15 @@ For `merged_and_closed`, also require a merged PR targeting the registered repos
 
 A merged PR with an open issue remains `awaiting_review`. A completed agent turn, successful CI, `agent:review`, or a parent checkbox does not satisfy the dependency by itself.
 
-A qualifying closure must be attributable to the configured human operator, after delivery for code issues. Extend the GitHub adapter to retrieve closure/reopen events and actor identity; a bot or an ambiguous automatic PR-associated closure requires attention. If human intent cannot be established from API data, require an explicit operator acknowledgement through `supervisor reconcile --child ... --ack-completion`. Acknowledgement cannot bypass a missing merge, `not_planned` closure, or an open issue. Record source events and operator acknowledgements durably.
+A qualifying closure must be attributable to the configured human operator, after delivery for code issues. **That closure is the approval**: there is no separate approval comment, and nothing about its timing relative to other comments matters. The GitHub adapter retrieves closure/reopen events and actor identity; a bot closure or one performed by a commit or app is ambiguous. Only then is `supervisor reconcile --child ... --ack-completion` needed, as an explicit operator attestation bound to that closure and delivery head. Acknowledgement cannot bypass a missing merge, `not_planned` closure, or an open issue. Record source events and operator acknowledgements durably.
 
-Human completion attests that the child's stated acceptance criteria are satisfied. For infrastructure work, this includes required live application and verification, not merely merged playbooks. The workpad MUST distinguish code delivery from operational validation. If required live checks are reported unrun, hold the plan for attention even if the issue is closed; operator reconciliation must reference subsequent evidence satisfying them. Set `requires_evidence: true` explicitly for such children. V1 requires an operator acknowledgement with an HTTPS evidence URL for these outcomes; it does not infer operational requirements from prose or interpret the evidence document.
+Human completion attests that the child's stated acceptance criteria are satisfied. For infrastructure work, this includes required live application and verification, not merely merged playbooks. Mark such children `requires_evidence` (label `changathi:evidence`). Their evidence is a property of the delivery, checked by Changathi rather than approved separately:
+
+1. The merged PR adds or changes exactly one Markdown report under `docs/validation/`: the evidence is that file at the PR's head commit. Several reports link the PR's file list.
+2. Otherwise, a line `Evidence: https://…` in the PR body.
+3. Otherwise, an HTTPS URL recorded with `supervisor reconcile --child ... --evidence URL`. It is bound to the current delivery head; a later generation needs its own evidence.
+
+The implementing agent of a `changathi:evidence` child is told to commit the report. While the child awaits review, the workpad shows the evidence link or that it is missing, so the operator can request rework before closing. A child closed without evidence does not satisfy the dependency and holds the plan; rework it, or record evidence with `reconcile --evidence`, which re-checks and releases the hold immediately. Changathi does not interpret the evidence document; the human does, before closing. Evidence URLs must be HTTPS with a host and no credentials.
 
 Re-fetch prerequisites before dispatch and before delivery/merge. If a prerequisite reopens or its evidence is invalidated, stop new dependent turns/delivery, preserve work, and enter `needs_attention`. Do not roll back already merged code or live infrastructure. GitHub events and merges are not one atomic transaction: if invalidation races a completed merge, surface it for reconciliation and block further advancement.
 
@@ -96,7 +77,7 @@ Each reconciliation pass:
 2. Refresh child issue/PR/review evidence. Unknown remote state blocks dependent dispatch; retain the previous snapshot for display only.
 3. Reconcile any owned attempt with the existing delivery state machine.
 4. Classify every unfinished child: in progress, awaiting human review or evidence, needing attention, or ready (all prerequisites satisfied and no owned attempt). Report them all with concrete reasons.
-5. Select every ready child, in plan order. Completed children are skipped; a closed-but-unsatisfied child (other than one waiting for evidence approval) holds the whole plan.
+5. Select every ready child, in plan order. Completed children are skipped; a closed-but-unsatisfied child (including one closed without required evidence) holds the whole plan.
 6. Atomically claim/enqueue each with trigger `supervisor`, plan ID/revision, child issue ID, and execution generation. The existing scheduler applies project/global capacity and fairness.
 7. Publish progress only when the persisted state changes.
 
@@ -133,7 +114,7 @@ On startup, reconcile remote issue/PR state, owned attempts, and surviving worke
 
 ## 9. GitHub and CLI experience
 
-Maintain one parent comment headed `Changathi supervisor`, using a hidden stable plan identifier. Show plan revision, current state, next eligible child or blocker, and a table of child dependencies, delivery PR, review status, and evidence links. Recover the comment by marker after ambiguous creation responses. Retry updates idempotently and edit only Changathi's own comment. Avoid repetitive comments for unchanged polls.
+Maintain one parent comment headed `Changathi supervisor`, using a hidden stable plan identifier. Show plan revision and source, current state, next eligible child or blocker, and a table of child dependencies, delivery PR, review status, and evidence links. Recover the comment by marker after ambiguous creation responses. Retry updates idempotently and edit only Changathi's own comment. Avoid repetitive comments for unchanged polls.
 
 Commands:
 
@@ -143,21 +124,21 @@ changathi supervisor start homelab#PARENT
 changathi supervisor list --project homelab
 changathi supervisor show homelab#PARENT
 changathi supervisor pause|resume|cancel homelab#PARENT
-changathi supervisor reload homelab#PARENT [--apply]
 changathi supervisor reconcile homelab#PARENT --child 4 --pr PR_NUMBER
-changathi supervisor reconcile homelab#PARENT --child 4 --ack-completion --evidence URL
+changathi supervisor reconcile homelab#PARENT --child 4 --evidence URL
+changathi supervisor reconcile homelab#PARENT --child 4 --ack-completion
 ```
 
-`validate` is read-only and reports schema, dependency, ownership, and eligibility problems. All mutations use request IDs and the local daemon API. Structured `--json` responses include blocked child IDs and precise reasons. No generic force/skip gate is included in v1.
+`validate` is read-only and reports graph, ownership, and eligibility problems for the plan as GitHub currently defines it. `reconcile` options may be combined; a reconciliation that resolves an attention hold re-checks the plan at once, without `resume`. All mutations use request IDs and the local daemon API. Structured `--json` responses include blocked child IDs and precise reasons. No generic force/skip gate is included in v1.
 
 `summary` and `supervisor list` show supervisor state separately from implementation agents, e.g. `homelab#PARENT: waiting_review on #4; #5 blocked by #4`. Supervision must not appear as one active worker or conceal available capacity.
 
 ## 10. Implementation map
 
 - `internal/core/model.go`: supervisor/revision/child/evidence models, attempt linkage, issue state reason and closure event fields.
-- `internal/core/github.go`: labelled-parent discovery, paginated review events, explicit PR evidence lookup, idempotent workpad operations.
+- `internal/core/github.go`, `supervisor_github.go`: labelled-parent discovery, sub-issue and blocked-by reads, paginated review events, PR evidence lookup, idempotent workpad operations.
 - `internal/core/store.go`: migrations, atomic ownership/enqueue operations, persisted supervisor transitions.
-- New `internal/core/supervisor.go`: strict plan parsing, graph validation, pure dependency eligibility evaluation.
+- New `internal/core/supervisor.go`: native plan construction, deprecated fenced-plan parsing, graph validation.
 - New `internal/service/supervisor.go`: reconciliation and child handoff into the existing scheduler.
 - `internal/service/engine.go`: shared dependency/parent gates in enqueue, turns, and delivery; exclude parents/owned children from normal automatic pickup. Its current `awaiting_review` logic accepts any closed issue and must not be reused as supervisor completion proof.
 - `internal/service/server.go`, `internal/cli/cli.go`, and `internal/cli/client.go`: API, commands, and operator reconciliation.
@@ -168,7 +149,7 @@ Repository `WORKFLOW.md` continues to configure implementation agents and valida
 
 After deterministic supervision is reliable, add bounded advisory turns for proposing graphs, summarizing failures, or assessing missing evidence. Such turns use a separately configured supervisor-agent limit (default disabled), a shared provider/account budget, timeouts, and usage accounting. They release their slot when waiting and never reserve a worker slot while requesting child execution.
 
-The advisory agent submits proposals to the daemon; it cannot bypass dependencies, declare human review complete, close issues, merge PRs, or alter authorization. Graph changes still follow revision/reload rules. Scheduling and restart recovery must remain correct with this feature disabled or its provider unavailable.
+The advisory agent submits proposals to the daemon; it cannot bypass dependencies, declare human review complete, close issues, merge PRs, or alter authorization. Graph changes still follow the adoption rules in §4. Scheduling and restart recovery must remain correct with this feature disabled or its provider unavailable.
 
 ## 12. Acceptance tests and rollout
 
@@ -177,8 +158,8 @@ Use fake GitHub/provider adapters and a controllable clock. Required tests:
 1. At global/project worker concurrency one, parent starts child A, waits after A's PR merges, then starts B only after A's qualifying human completion. No idle supervisor occupies a slot.
 2. `auto: false` does not start a labelled parent; explicit start advances eligible children. `auto: true` discovers a labelled parent once.
 3. Ordinary auto/manual dispatch cannot run a parent as a worker or bypass an enrolled child's dependencies. Racing triggers create one generation.
-4. Invalid graphs, foreign/missing issues, cycles, duplicated ownership, and conflicting existing attempts fail before any dispatch.
-5. Closed-as-not-planned, missing merge, unknown closure reason/actor, bot closure, and unverified required operational outcomes all block advancement.
+4. Invalid graphs, foreign/missing issues, blockers outside the plan, cycles, duplicated ownership, and conflicting existing attempts fail before any dispatch. Unsafe graph edits hold the plan until undone; safe edits are adopted without operator action.
+5. Closed-as-not-planned, missing merge, unknown closure reason/actor, bot closure, and a delivery without required evidence all block advancement. A human closure of a delivery with evidence advances without any further action.
 6. A completed external prerequisite is accepted only through explicit verified evidence association. Human reconciliation is auditable.
 7. Parent edits, pause, label removal, cancellation, and project pause stop later turns/delivery; resume preserves unfinished work.
 8. A reopened prerequisite before dispatch or during execution blocks its descendants; an already completed merge is surfaced without destructive rollback.
@@ -191,21 +172,25 @@ Implement in stages: schema/parser and persistence; read-only validation/status;
 
 ## Implementation notes
 
-The controller is deterministic; advisory agent support remains deferred. The authenticated `gh` user is the human operator. `requires_evidence` is an explicit child schema field because operational requirements cannot reliably be inferred from issue text. `closed_completed` children are manual gates and never create code workers.
+The controller is deterministic; advisory agent support remains deferred. The authenticated `gh` user is the human operator. `requires_evidence` is an explicit child policy (a label) because operational requirements cannot reliably be inferred from issue text. `closed_completed` children are manual gates and never create code workers.
 
-Reload previews the old/new structured plans. `--apply` requires no active child execution and preserves a paused state; resume is explicit. The initial implementation rejects removal of any dispatched child and policy/dependency changes to a dispatched child. This is stricter than the original invalidation design; append-only expansion with existing edges retained is supported.
+Each reconciliation reads the sub-issues and one blocked-by list per child, in addition to the per-child issue, delivery and closure reads; evidence lookups are cached per delivery head.
 
 Supervisor records and canonical revisions use new kinds in the existing SQLite records store, with schema version 1 in the plan; enrollment and ownership changes share one transaction. Core workers continue through the existing delivery pipeline. Remote reconciliation failures back off up to four minutes; workpad failures retry after two minutes. Reconciled comments use stable markers and journaled publication intent. All remote evidence is checked again before dispatch/delivery; GitHub cannot provide an atomic transaction spanning closure state and merge.
 
 Automated verification uses fake GitHub/provider adapters and local Git repositories. Tests cover actual worker delivery with concurrency one, human completion gates, explicit evidence, plan expansion, ownership races, SQLite reopen, interruption, API failure, comment recovery, and CLI requests. They do not perform real GitHub mutations or live infrastructure changes.
 
 
-## GitHub evidence approval and attempt supersession
-
-Operational evidence can be approved directly on the child issue after closing it as completed. The daemon posts the exact `/approve-evidence #PR HTTPS_URL` comment to copy, with the current PR and validation report link already filled in. The parent workpad mirrors this action. Only a new, unedited comment by the authenticated human operator after the current closure qualifies. All existing merged-delivery checks remain required. Valid approval releases an evidence-only hold automatically; it does not override explicit pause/cancel or other dependency failures. GitHub comment approvals are revalidated, including deletion or edits, on subsequent reconciliation. CLI acknowledgement remains a fallback.
+## Attempt supersession
 
 Old awaiting-review attempts become superseded when replaced by a new generation. Startup repairs historical stale rows. Superseded attempts are inactive, retain audit history, and never consume a worker slot.
 
+## Closure-only approval and native plans (2026-10-19)
+
+Between 2026-10-09 and 2026-10-19, operational evidence was approved by a second human step: after closing the child, the operator posted an exact `/approve-evidence #PR URL` comment that had to be a new, unedited comment created after the closure. In practice that duplicated the closure (same person, same moment) and failed on ordering alone. It is removed: closure is the approval, and evidence is checked on the delivery itself (§5). Old approval comments are ignored, and rework still skips them when collecting operator feedback.
+
+The fenced YAML plan with its `reload` / `reload --apply` / `resume` cycle is replaced by GitHub sub-issues and blocked-by links, re-read every pass (§3, §4). The fenced form remains as a deprecated fallback for parents that still contain it.
+
 ## Parallel children (2026-10-12)
 
-The original one-unfinished-child rule existed because the operator's Codex plan allowed one concurrent session. That is now expressed as the global default `concurrency: 1`. The supervisor records every selected child in `ready` (with `current` kept as a display hint) and queues them all; the scheduler runs them as capacity allows. A child waiting for `/approve-evidence` is a per-child wait rather than a plan-wide hold, and a failed or cancelled child no longer cancels running siblings. Plan-wide holds remain for graph changes, label removal, pauses, unsatisfied closures, and regressed prerequisites of dispatched children.
+The original one-unfinished-child rule existed because the operator's Codex plan allowed one concurrent session. That is now expressed as the global default `concurrency: 1`. The supervisor records every selected child in `ready` (with `current` kept as a display hint) and queues them all; the scheduler runs them as capacity allows. A failed or cancelled child no longer cancels running siblings. Plan-wide holds remain for graph changes, label removal, pauses, unsatisfied closures, and regressed prerequisites of dispatched children.

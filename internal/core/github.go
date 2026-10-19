@@ -214,7 +214,7 @@ func (g GH) RemoveLabel(ctx context.Context, p Project, n int, label string) err
 // Prepare creates the labels Changathi relies on and reports setup problems
 // that would block dispatch, such as a missing WORKFLOW.md on the base branch.
 func (g GH) Prepare(ctx context.Context, p Project) ([]string, error) {
-	for _, l := range []struct{ name, color string }{{"agent:ready", "0e8a16"}, {"agent:review", "5319e7"}, {"agent:rework", "d93f0b"}, {"supervisor", "1d76db"}} {
+	for _, l := range []struct{ name, color string }{{"agent:ready", "0e8a16"}, {"agent:review", "5319e7"}, {"agent:rework", "d93f0b"}, {"supervisor", "1d76db"}, {EvidenceLabel, "fbca04"}, {ManualLabel, "c5def5"}} {
 		if e := g.ensureLabel(ctx, p, l.name, l.color); e != nil {
 			return nil, fmt.Errorf("create label %s: %w", l.name, e)
 		}

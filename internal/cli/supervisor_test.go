@@ -36,15 +36,22 @@ func TestSupervisorCLIRequests(t *testing.T) {
 	go srv.Serve(listener)
 	defer srv.Close()
 	cases := []struct {
-		args       []string
-		action     string
-		apply, ack bool
-		child      int
+		args     []string
+		action   string
+		ack      bool
+		evidence string
+		child    int
 	}{
-		{[]string{"start", "homelab#12"}, "supervisor.start", false, false, 0},
-		{[]string{"reload", "homelab#12"}, "supervisor.reload", false, false, 0},
-		{[]string{"reload", "homelab#12", "--apply"}, "supervisor.reload", true, false, 0},
-		{[]string{"reconcile", "homelab#12", "--child", "4", "--ack-completion", "--evidence", "https://example.test/report"}, "supervisor.reconcile", false, true, 4},
+		{[]string{"start", "homelab#12"}, "supervisor.start", false, "", 0},
+		{[]string{"reconcile", "homelab#12", "--child", "4", "--evidence", "https://example.test/report"}, "supervisor.reconcile", false, "https://example.test/report", 4},
+		{[]string{"reconcile", "homelab#12", "--child", "4", "--ack-completion"}, "supervisor.reconcile", true, "", 4},
+	}
+	a := &app{config: core.DefaultConfig(), out: &bytes.Buffer{}}
+	a.config.DataDir = dir
+	cmd := a.supervisor()
+	cmd.SetArgs([]string{"reload", "homelab#12"})
+	if err := cmd.ExecuteContext(context.Background()); err == nil {
+		t.Fatal("reload is gone; plans are re-read from GitHub")
 	}
 	for _, tc := range cases {
 		a := &app{config: core.DefaultConfig(), out: &bytes.Buffer{}}
@@ -55,7 +62,7 @@ func TestSupervisorCLIRequests(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := <-requests
-		if r.Project != "homelab" || r.Number != 12 || r.Action != tc.action || r.Apply != tc.apply || r.AckCompletion != tc.ack || r.Child != tc.child {
+		if r.Project != "homelab" || r.Number != 12 || r.Action != tc.action || r.Evidence != tc.evidence || r.AckCompletion != tc.ack || r.Child != tc.child {
 			t.Fatal(r)
 		}
 	}
