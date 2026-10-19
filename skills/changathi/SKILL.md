@@ -85,24 +85,17 @@ changathi issue run '<project>#<number>'                                        
 ## Coordinate dependent issues (supervisor)
 
 1. Create every child issue first, without `agent:ready`. The supervisor dispatches children itself when their dependencies are met.
-2. Create the parent issue with the `supervisor` label and exactly one fenced plan block:
+2. Create the parent issue (goal in prose) with the `supervisor` label, then build the plan from GitHub's issue relationships. The API takes issue IDs, not numbers:
 
-   ````markdown
-   Goal of the whole effort, in prose.
-
-   ```changathi-supervisor
-   version: 1
-   children:
-     - issue: 3
-       depends_on: []
-       completion: merged_and_closed   # default; closed_completed = manual gate, no agent
-     - issue: 4
-       depends_on: [3]
-       requires_evidence: true          # human must attach an HTTPS evidence URL
+   ```sh
+   id() { gh api repos/owner/repo/issues/$1 --jq .id; }
+   gh api repos/owner/repo/issues/<parent>/sub_issues -F sub_issue_id=$(id 3)      # each child, in order
+   gh api repos/owner/repo/issues/4/dependencies/blocked_by -F issue_id=$(id 3)  # #4 depends on #3
+   gh issue edit 4 --repo owner/repo --add-label changathi:evidence             # PR must carry evidence
+   gh issue edit 5 --repo owner/repo --add-label changathi:manual               # manual gate, no agent
    ```
-   ````
 
-   Children must be issues, not PRs, in the same repository. Dependencies must not form cycles, and a child can't carry the `supervisor` label.
+   Sub-issue order breaks ties between ready children. Every blocker must itself be a sub-issue of the parent, in the same repository. Dependencies must not form cycles, and a child can't carry the `supervisor` label. A `changathi:evidence` child must commit one report under `docs/validation/` (the agent is told to) or have an `Evidence: https://…` line in its PR body. Older parents with a fenced `changathi-supervisor` YAML block still work, but new plans should use sub-issues.
 3. Validate the plan, then start it. Auto projects start it on their own.
 
    ```sh
@@ -111,7 +104,13 @@ changathi issue run '<project>#<number>'                                        
    changathi supervisor show '<project>#<parent>'
    ```
 
-A child counts as complete only when its PR is merged **and** a human closes the issue as completed. If the parent body changes, run `supervisor reload` and then `reload --apply` (the plan stays paused), followed by `supervisor resume`. Work that was done outside Changathi is accepted with `supervisor reconcile --child N --pr M`. For `requires_evidence` children, the human reviews the evidence, closes the child and posts the `/approve-evidence #PR URL` comment that Changathi suggests on it. `supervisor reconcile --child N --ack-completion --evidence <url>` is the CLI fallback. Never post approvals, make up an evidence URL or acknowledge completion on the user's behalf.
+A child counts as complete only when its PR is merged **and** a human closes the issue as completed. That closure is the only approval; there is no approval comment. Changathi re-reads the graph every poll, so edit sub-issues and blocked-by links on GitHub directly. A change that would orphan or re-gate work in flight (removing a dispatched child, adding a blocker to it, changing its manual/agent policy, or a blocker outside the plan) holds the plan with a `plan change rejected:` reason until it is undone; nothing else is needed. Fallbacks, each of which releases the hold it fixes:
+
+- `supervisor reconcile --child N --pr M`: work done outside Changathi.
+- `supervisor reconcile --child N --evidence <https-url>`: evidence the delivery PR lacks.
+- `supervisor reconcile --child N --ack-completion`: a closure GitHub attributes to a bot or a commit.
+
+Never make up an evidence URL or acknowledge completion on the user's behalf. A cancelled or finished plan restarts with `supervisor start`.
 
 ## Check in
 
@@ -139,5 +138,5 @@ There is no way to message a running agent. The user reviews and asks for rework
 ## Leave to the human
 
 - Closing issues. Closure is the human review gate, so don't close issues for them with `gh` either.
-- Evidence acknowledgements for supervisor children.
+- Evidence URLs and completion acknowledgements for supervisor children.
 - Cleaning worktrees (`changathi workspace clean <id> --apply`), unless they ask.

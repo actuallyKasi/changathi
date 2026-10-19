@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -21,6 +22,7 @@ type Closure struct {
 type DeliveryEvidence struct {
 	Number   int       `json:"number"`
 	URL      string    `json:"html_url"`
+	Body     string    `json:"body"`
 	MergedAt time.Time `json:"merged_at"`
 	Head     struct {
 		SHA string `json:"sha"`
@@ -158,10 +160,41 @@ func (g GH) EvidenceComments(ctx context.Context, p Project, n int) ([]EvidenceC
 	}
 }
 
+// IssueRelations reads GitHub's native sub-issue and blocked-by links, which
+// define a supervisor plan. It is optional so older adapters remain compatible.
+type IssueRelations interface {
+	SubIssues(context.Context, Project, int) ([]Issue, error)
+	BlockedBy(context.Context, Project, int) ([]Issue, error)
+}
+
+func (g GH) SubIssues(ctx context.Context, p Project, n int) ([]Issue, error) {
+	return g.issuePages(ctx, fmt.Sprintf("repos/%s/issues/%d/sub_issues", p.Repo, n))
+}
+func (g GH) BlockedBy(ctx context.Context, p Project, n int) ([]Issue, error) {
+	return g.issuePages(ctx, fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", p.Repo, n))
+}
+func (g GH) issuePages(ctx context.Context, path string) ([]Issue, error) {
+	out := []Issue{}
+	for page := 1; ; page++ {
+		var batch []Issue
+		if err := g.api(ctx, fmt.Sprintf("%s?per_page=100&page=%d", path, page), &batch); err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < 100 {
+			return out, nil
+		}
+	}
+}
+
+// EvidenceReportFinder locates the operational evidence a merged PR delivered.
 type EvidenceReportFinder interface {
 	EvidenceReport(context.Context, Project, int) (string, error)
 }
 
+// EvidenceReport returns the validation report committed under EvidenceDir by PR
+// pr, or else an "Evidence: https://..." line in the PR body. It returns "" when
+// the PR carries no evidence.
 func (g GH) EvidenceReport(ctx context.Context, p Project, pr int) (string, error) {
 	delivery, err := g.Delivery(ctx, p, pr)
 	if err != nil {
@@ -177,7 +210,7 @@ func (g GH) EvidenceReport(ctx context.Context, p Project, pr int) (string, erro
 			return "", err
 		}
 		for _, f := range files {
-			if f.Status != "removed" && strings.HasPrefix(f.Name, "docs/validation/") && strings.HasSuffix(f.Name, ".md") {
+			if f.Status != "removed" && strings.HasPrefix(f.Name, EvidenceDir) && strings.HasSuffix(f.Name, ".md") {
 				reports = append(reports, f.Name)
 			}
 		}
@@ -185,8 +218,28 @@ func (g GH) EvidenceReport(ctx context.Context, p Project, pr int) (string, erro
 			break
 		}
 	}
-	if len(reports) == 1 && delivery.Head.SHA != "" {
+	switch {
+	case len(reports) == 1 && delivery.Head.SHA != "":
 		return fmt.Sprintf("https://github.com/%s/blob/%s/%s", p.Repo, delivery.Head.SHA, reports[0]), nil
+	case len(reports) > 1:
+		return fmt.Sprintf("https://github.com/%s/pull/%d/files", p.Repo, pr), nil
 	}
-	return fmt.Sprintf("https://github.com/%s/pull/%d", p.Repo, pr), nil
+	return EvidenceLine(delivery.Body), nil
+}
+
+// EvidenceLine returns the HTTPS URL from the first "Evidence: <url>" line in body.
+func EvidenceLine(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && strings.EqualFold(f[0], "Evidence:") && ValidEvidenceURL(f[1]) {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// ValidEvidenceURL accepts only HTTPS URLs with a host and no credentials.
+func ValidEvidenceURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil
 }

@@ -3,8 +3,9 @@ package service
 import (
 	"changathi/internal/core"
 	"context"
+	"errors"
 	"fmt"
-	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -24,7 +25,7 @@ func (e *Engine) loadSupervisor(ctx context.Context, p core.Project, n int) (cor
 	if parent.ID == 0 || parent.Number != n || parent.State != "open" || !parent.Supervisor() {
 		return core.Supervisor{}, fmt.Errorf("parent must be an open issue labelled supervisor")
 	}
-	plan, rev, err := core.ParseSupervisor(parent.Body, n)
+	plan, rev, err := e.readPlan(ctx, p, parent)
 	if err != nil {
 		return core.Supervisor{}, err
 	}
@@ -59,6 +60,109 @@ func (e *Engine) loadSupervisor(ctx context.Context, p core.Project, n int) (cor
 	}
 	return v, nil
 }
+
+// readPlan derives the plan from the parent's sub-issues and their blocked-by
+// links. A parent body with the deprecated fenced YAML block keeps using it.
+// API failures are returned as is; problems with the graph itself are planErrors.
+func (e *Engine) readPlan(ctx context.Context, p core.Project, parent core.Issue) (core.SupervisorPlan, string, error) {
+	if core.HasPlanBlock(parent.Body) {
+		plan, rev, err := core.ParseSupervisor(parent.Body, parent.Number)
+		return plan, rev, asPlanError(err)
+	}
+	rel, ok := e.GitHub.(core.IssueRelations)
+	if !ok {
+		return core.SupervisorPlan{}, "", planError{fmt.Errorf("GitHub adapter does not read sub-issues")}
+	}
+	subs, err := rel.SubIssues(ctx, p, parent.Number)
+	if err != nil {
+		return core.SupervisorPlan{}, "", err
+	}
+	if len(subs) > 100 {
+		return core.SupervisorPlan{}, "", planError{fmt.Errorf("version 1 requires 1–100 children")}
+	}
+	blocked := map[int][]core.Issue{}
+	for _, i := range subs {
+		if blocked[i.Number], err = rel.BlockedBy(ctx, p, i.Number); err != nil {
+			return core.SupervisorPlan{}, "", err
+		}
+	}
+	plan, rev, err := core.NativePlan(p.Repo, parent.Number, subs, blocked)
+	return plan, rev, asPlanError(err)
+}
+
+// planError is a problem with the graph on GitHub, as opposed to a failure to read it.
+type planError struct{ error }
+
+func asPlanError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return planError{err}
+}
+
+// planChangePrefix marks a hold that the next reconciliation re-evaluates, so
+// fixing the sub-issues or blocked-by links on GitHub releases it on its own.
+const planChangePrefix = "plan change rejected: "
+
+func planHold(v core.Supervisor) bool {
+	return v.Hold == "attention" && strings.HasPrefix(v.Reason, planChangePrefix)
+}
+
+// adoptPlan switches an enrolled supervisor to a changed graph. Edits that would
+// orphan or re-police dispatched work are refused; the plan holds until they are undone.
+func (e *Engine) adoptPlan(ctx context.Context, p core.Project, v *core.Supervisor, plan core.SupervisorPlan, revision string) error {
+	as, err := core.List[core.Attempt](e.Store, "attempt")
+	if err != nil {
+		return err
+	}
+	fresh := *v
+	fresh.Plan = plan
+	fresh.Revision = revision
+	fresh.Evidence = map[int]core.ChildEvidence{}
+	for _, old := range v.Plan.Children {
+		a := latestChild(as, p.ID, old.Issue)
+		dispatched := a != nil && a.SupervisorID == v.ID
+		c, kept := fresh.Child(old.Issue)
+		if !kept && dispatched {
+			return planError{fmt.Errorf("child #%d was dispatched; restore it to the plan", old.Issue)}
+		}
+		if kept && dispatched && c.Completion != old.Completion {
+			return planError{fmt.Errorf("cannot change the completion policy of dispatched child #%d", old.Issue)}
+		}
+		// A new blocker cannot be satisfied retroactively by work already under way.
+		if kept && dispatched && a.State != "done" {
+			for _, d := range c.DependsOn {
+				if !slices.Contains(old.DependsOn, d) {
+					return planError{fmt.Errorf("cannot add blocker #%d to dispatched child #%d", d, old.Issue)}
+				}
+			}
+		}
+		if kept {
+			fresh.Evidence[old.Issue] = v.Evidence[old.Issue]
+		}
+	}
+	for _, c := range plan.Children {
+		if _, ok := fresh.Evidence[c.Issue]; ok {
+			continue
+		}
+		i, err := e.GitHub.Issue(ctx, p, c.Issue)
+		if err != nil {
+			return err
+		}
+		if i.ID == 0 || i.Number != c.Issue || i.Supervisor() || i.PullRequest != nil {
+			return planError{fmt.Errorf("#%d must be a normal issue in this repository", c.Issue)}
+		}
+		fresh.Evidence[c.Issue] = core.ChildEvidence{IssueID: i.ID}
+	}
+	// Enrollment refuses children owned elsewhere or with conflicting attempts.
+	if err := e.Store.EnrollSupervisor(fresh); err != nil {
+		return planError{err}
+	}
+	_ = e.Store.Event(v.ID, "supervisor_plan", fmt.Sprintf("adopted plan %s", revision[:12]))
+	*v = fresh
+	return nil
+}
+
 func latestChild(as []core.Attempt, p string, n int) *core.Attempt {
 	var latest *core.Attempt
 	for _, a := range as {
@@ -70,11 +174,32 @@ func latestChild(as []core.Attempt, p string, n int) *core.Attempt {
 	return latest
 }
 
-const evidencePending = "approve evidence on this closed issue with /approve-evidence #PR HTTPS_URL"
-const legacyEvidencePending = "operational outcome requires supervisor reconcile --ack-completion --evidence URL"
+// evidenceFor returns the operational evidence for child n's delivery at head:
+// operator-supplied evidence for that head, or else what the merged PR carries.
+// The result is cached on v and "" means the delivery has none.
+func (e *Engine) evidenceFor(ctx context.Context, p core.Project, v core.Supervisor, n, pr int, head string) (string, error) {
+	ev := v.Evidence[n]
+	if ev.EvidenceURL != "" && ev.EvidenceHead == head {
+		return ev.EvidenceURL, nil
+	}
+	finder, ok := e.GitHub.(core.EvidenceReportFinder)
+	if pr == 0 || !ok {
+		return "", nil
+	}
+	found, err := finder.EvidenceReport(ctx, p, pr)
+	if err != nil || found == "" {
+		return "", err
+	}
+	ev.EvidenceURL, ev.EvidenceHead, ev.EvidenceSource = found, head, "pr"
+	v.Evidence[n] = ev
+	return found, nil
+}
 
-func evidenceHold(v core.Supervisor) bool {
-	return v.Hold == "attention" && (strings.HasSuffix(v.Reason, ": "+evidencePending) || strings.HasSuffix(v.Reason, ": "+legacyEvidencePending))
+func missingEvidence(pr int) string {
+	if pr == 0 {
+		return "no operational evidence; record it with supervisor reconcile --evidence URL"
+	}
+	return fmt.Sprintf("PR #%d has no operational evidence (a report under %s or an \"Evidence: https://…\" line); rework the issue or use supervisor reconcile --evidence URL", pr, core.EvidenceDir)
 }
 
 func (e *Engine) completed(ctx context.Context, p core.Project, v core.Supervisor, c core.SupervisorChild, i core.Issue, a *core.Attempt) (bool, int, string, error) {
@@ -119,33 +244,19 @@ func (e *Engine) completed(ctx context.Context, p core.Project, v core.Superviso
 	if err != nil {
 		return false, prnum, "", err
 	}
-	ack := ev.ApprovalCommentID == 0 && ev.AcknowledgedBy == operator && ev.AckClosedAt.Equal(i.ClosedAt) && ev.AckUpdatedAt.Equal(i.UpdatedAt) && ev.AckHead == head
-	if c.RequiresEvidence && (!ack || ev.EvidenceURL == "") {
-		if reader, supported := e.GitHub.(core.EvidenceComments); supported {
-			comments, err := reader.EvidenceComments(ctx, p, i.Number)
-			if err != nil {
-				return false, prnum, "", err
-			}
-			for _, comment := range comments {
-				if !validEvidenceComment(comment, operator, prnum, i.ClosedAt) {
-					continue
-				}
-				fields := strings.Fields(comment.Body)
-				ev.EvidenceURL = fields[2]
-				ev.ApprovalCommentID = comment.ID
-				ev.AcknowledgedBy = operator
-				ev.AckClosedAt = i.ClosedAt
-				ev.AckUpdatedAt = i.UpdatedAt
-				ev.AckHead = head
-				v.Evidence[c.Issue] = ev
-				ack = true
-				break
-			}
+	// The human closing the issue as completed is the approval. Evidence is a
+	// property of the delivery, checked here rather than approved separately.
+	if c.RequiresEvidence {
+		found, err := e.evidenceFor(ctx, p, v, c.Issue, prnum, head)
+		if err != nil {
+			return false, prnum, "", err
 		}
-		if !ack || ev.EvidenceURL == "" {
-			return false, prnum, evidencePending, nil
+		if found == "" {
+			return false, prnum, missingEvidence(prnum), nil
 		}
 	}
+	// An explicit acknowledgement stands in for an ambiguous (bot or automatic) closure.
+	ack := ev.AcknowledgedBy == operator && ev.AckClosedAt.Equal(i.ClosedAt) && ev.AckUpdatedAt.Equal(i.UpdatedAt) && ev.AckHead == head
 	if !ack {
 		closure, err := g.Closure(ctx, p, i.Number)
 		if err != nil {
@@ -168,20 +279,28 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 	if parent.ID != v.Parent.ID {
 		return nil, fmt.Errorf("parent identity changed")
 	}
-	plan, revision, err := core.ParseSupervisor(parent.Body, parent.Number)
-	_ = plan
-	if err != nil || revision != v.Revision {
-		v.State = "needs_attention"
-		v.Hold = "attention"
-		v.Reason = "parent graph changed; validate and reload the plan"
-		return nil, nil
-	}
 	v.Parent = parent
 	if !parent.Supervisor() {
 		v.State = "paused"
 		v.Hold = "paused"
 		v.Reason = "parent supervisor label removed"
 		return nil, nil
+	}
+	// The graph lives on GitHub and is re-read every pass. An unreadable or
+	// unsafe change holds the plan until it is fixed there.
+	plan, revision, err := e.readPlan(ctx, p, parent)
+	if err == nil && revision != v.Revision {
+		err = e.adoptPlan(ctx, p, v, plan, revision)
+	}
+	var invalid planError
+	if errors.As(err, &invalid) {
+		v.State = "needs_attention"
+		v.Hold = "attention"
+		v.Reason = planChangePrefix + err.Error()
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	as, err := core.List[core.Attempt](e.Store, "attempt")
 	if err != nil {
@@ -217,6 +336,15 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 				v.Reason = fmt.Sprintf("previously completed child #%d no longer satisfies its gate", c.Issue)
 			}
 		}
+		if !ok && c.RequiresEvidence && a != nil && a.SupervisorID == v.ID && a.State == "awaiting_review" {
+			found, err := e.evidenceFor(ctx, p, *v, c.Issue, a.PR, a.Head)
+			if err != nil {
+				return nil, err
+			}
+			if found == "" {
+				status.Reason = missingEvidence(a.PR)
+			}
+		}
 		if ok {
 			status.State = "completed"
 			status.Reason = ""
@@ -235,10 +363,6 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 				}
 			}
 		}
-	}
-	// Evidence approval is a per-child wait now, never a plan-wide hold.
-	if evidenceHold(*v) {
-		v.Hold = ""
 	}
 	if v.Hold == "attention" {
 		v.State = "needs_attention"
@@ -307,11 +431,6 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 		a := latestChild(as, p.ID, c.Issue)
 		if issues[c.Issue].State == "closed" {
 			reason := childStatus(*v, c.Issue).Reason
-			if reason == evidencePending {
-				review = append(review, c.Issue)
-				notes = append(notes, fmt.Sprintf("#%d: %s", c.Issue, reason))
-				continue
-			}
 			v.Current = c.Issue
 			v.State = "needs_attention"
 			v.Hold = "attention"
@@ -412,14 +531,11 @@ func (e *Engine) saveSupervisor(ctx context.Context, p core.Project, v *core.Sup
 	if err := e.Store.Put("supervisor", v.ID, v); err != nil {
 		return err
 	}
-	if !v.WorkpadRetryAt.After(core.Now()) {
-		if err := e.publishApprovalPrompts(ctx, p, v); err != nil {
-			v.WorkpadError = err.Error()
-			v.WorkpadRetryAt = core.Now().Add(2 * time.Minute)
-			return e.Store.Put("supervisor", v.ID, v)
-		}
+	source := "sub-issues and their blocked-by links"
+	if v.Plan.Source == core.PlanBody {
+		source = "the `changathi-supervisor` block in this issue (deprecated; move it to sub-issues)"
 	}
-	body := fmt.Sprintf("## Changathi supervisor\n\nPlan `%s`\n\nState: **%s**. %s\n\n| Child | Dependencies | State | PR | Detail |\n| --- | --- | --- | --- | --- |\n", v.Revision[:12], v.State, v.Reason)
+	body := fmt.Sprintf("## Changathi supervisor\n\nPlan `%s` from %s\n\nState: **%s**. %s\n\n| Child | Dependencies | State | PR | Detail |\n| --- | --- | --- | --- | --- |\n", v.Revision[:12], source, v.State, v.Reason)
 	clean := func(s string) string { return strings.NewReplacer("|", "/", "\n", " ", "\r", " ").Replace(s) }
 	for _, c := range v.Plan.Children {
 		status := childStatus(*v, c.Issue)
@@ -437,12 +553,7 @@ func (e *Engine) saveSupervisor(ctx context.Context, p core.Project, v *core.Sup
 		}
 		body += fmt.Sprintf("| #%d | %s | %s | %s | %s |\n", c.Issue, strings.Join(deps, ", "), status.State, pr, clean(detail))
 	}
-	for _, c := range v.Plan.Children {
-		status := childStatus(*v, c.Issue)
-		if prompt, ok := v.ApprovalPrompts[c.Issue]; ok && prompt.PR == status.PR && status.State != "completed" {
-			body += fmt.Sprintf("\n### Approve #%d\n\nReview [the evidence](%s), close #%d as completed, then post this exact comment **on #%d**:\n\n```text\n/approve-evidence #%d %s\n```\n\nChangathi validates your approval and advances automatically.\n", c.Issue, prompt.URL, c.Issue, c.Issue, prompt.PR, prompt.URL)
-		}
-	}
+	body += "\nReview each delivered child and close it as completed to let its dependants start.\n"
 
 	hash := core.SupervisorHash(body)
 	if hash == v.PublishedHash || v.WorkpadRetryAt.After(core.Now()) {
@@ -476,13 +587,13 @@ func (e *Engine) saveSupervisor(ctx context.Context, p core.Project, v *core.Sup
 	return e.Store.Put("supervisor", v.ID, v)
 }
 func (e *Engine) reconcileSupervisor(ctx context.Context, p core.Project, v core.Supervisor) error {
-	if v.Hold != "" && !evidenceHold(v) {
+	if v.Hold != "" && !planHold(v) {
 		e.stopSupervisor(v)
 		return e.saveSupervisor(ctx, p, &v)
 	}
-	// Recompute evidence-only holds from current GitHub state. An API error
+	// Recompute plan-change holds from current GitHub state. An API error
 	// must remain retryable rather than turning this into an unrelated hold.
-	if evidenceHold(v) {
+	if planHold(v) {
 		v.Hold = ""
 	}
 	if !p.Enabled {
@@ -634,9 +745,10 @@ func (e *Engine) supervisorGateLocked(ctx context.Context, p core.Project, a cor
 	if err = e.Store.Get("supervisor", owner, &v); err != nil {
 		return err
 	}
-	if v.Hold != "" || v.State == "done" || v.Revision != a.PlanRevision {
-		return fmt.Errorf("supervisor is paused, changed, or complete")
+	if (v.Hold != "" && !planHold(v)) || v.State == "done" {
+		return fmt.Errorf("supervisor is paused or complete")
 	}
+	v.Hold = ""
 	issues, err := e.inspectSupervisor(ctx, p, &v)
 	if err != nil {
 		return err
@@ -644,13 +756,13 @@ func (e *Engine) supervisorGateLocked(ctx context.Context, p core.Project, a cor
 	if v.Hold != "" || v.Parent.State != "open" || issues[a.Issue.Number].State != "open" {
 		return fmt.Errorf("supervisor gate: %s", v.Reason)
 	}
-	for _, c := range v.Plan.Children {
-		if c.Issue == a.Issue.Number {
-			for _, dep := range c.DependsOn {
-				if childStatus(v, dep).State != "completed" {
-					return fmt.Errorf("dependency #%d is incomplete", dep)
-				}
-			}
+	c, ok := v.Child(a.Issue.Number)
+	if !ok {
+		return fmt.Errorf("#%d is no longer in the plan", a.Issue.Number)
+	}
+	for _, dep := range c.DependsOn {
+		if childStatus(v, dep).State != "completed" {
+			return fmt.Errorf("dependency #%d is incomplete", dep)
 		}
 	}
 	return nil
@@ -672,7 +784,20 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 			return nil, fmt.Errorf("project is paused")
 		}
 		if old, err := e.Store.SupervisorFor(p.ID, r.Number); err == nil {
-			return nil, fmt.Errorf("already enrolled (%s); use resume or reload", old.State)
+			// Restarting a cancelled or finished plan is explicit; the next pass
+			// re-reads its graph from GitHub.
+			if old.Hold != "cancelled" && old.State != "done" {
+				return nil, fmt.Errorf("already enrolled (%s); use resume", old.State)
+			}
+			old.Hold = ""
+			old.State = "queued"
+			old.Reason = "operator restarted"
+			old.RetryAt = time.Time{}
+			if err = e.reconcileSupervisor(ctx, p, old); err != nil {
+				return nil, err
+			}
+			e.Wake()
+			return e.Store.SupervisorFor(p.ID, r.Number)
 		}
 		v, err := e.loadSupervisor(ctx, p, r.Number)
 		if err != nil {
@@ -712,7 +837,7 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 			return nil, fmt.Errorf("project is paused")
 		}
 		if v.Hold == "cancelled" || v.State == "done" {
-			return nil, fmt.Errorf("cancelled/completed plans require reload --apply before resume")
+			return nil, fmt.Errorf("cancelled/completed plans restart with supervisor start")
 		}
 		v.Hold = ""
 		v.State = "queued"
@@ -726,72 +851,13 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 		}
 		e.Wake()
 		return e.Store.SupervisorFor(p.ID, r.Number)
-	case "reload":
-		fresh, err := e.loadSupervisor(ctx, p, r.Number)
-		if err != nil {
-			return nil, err
-		}
-		if !r.Apply {
-			return map[string]any{"current_revision": v.Revision, "proposed_revision": fresh.Revision, "current": v.Plan, "proposed": fresh.Plan, "apply_command": "supervisor reload --apply"}, nil
-		}
-		as, err := core.List[core.Attempt](e.Store, "attempt")
-		if err != nil {
-			return nil, err
-		}
-		for _, a := range as {
-			if a.SupervisorID == v.ID && a.Active() {
-				return nil, fmt.Errorf("pause the supervisor and wait for active workers before reload")
-			}
-		}
-		e.mu.Lock()
-		busy := false
-		for _, a := range as {
-			if a.SupervisorID == v.ID {
-				if _, ok := e.workers[a.ID]; ok {
-					busy = true
-				}
-			}
-		}
-		e.mu.Unlock()
-		if busy {
-			return nil, fmt.Errorf("worker is still stopping")
-		}
-		for _, old := range v.Plan.Children {
-			c, kept := fresh.Child(old.Issue)
-			a := latestChild(as, p.ID, old.Issue)
-			if !kept {
-				if a != nil {
-					return nil, fmt.Errorf("cannot remove dispatched child #%d", old.Issue)
-				}
-			} else {
-				if core.SupervisorHash(c) != core.SupervisorHash(old) && a != nil {
-					return nil, fmt.Errorf("cannot change policy/dependencies of dispatched child #%d", old.Issue)
-				}
-				if ev := v.Evidence[old.Issue]; ev.PR != 0 || ev.AcknowledgedBy != "" {
-					if core.SupervisorHash(c) != core.SupervisorHash(old) {
-						return nil, fmt.Errorf("cannot change an evidenced child policy")
-					}
-				}
-				fresh.Evidence[old.Issue] = v.Evidence[old.Issue]
-			}
-		}
-		v.Plan = fresh.Plan
-		v.Revision = fresh.Revision
-		v.Evidence = fresh.Evidence
-		v.Parent = fresh.Parent
-		v.Hold = "paused"
-		v.State = "paused"
-		v.Reason = "plan reloaded; resume to dispatch"
-		v.Current = 0
-		v.Ready = nil
-		v.Children = nil
-		if err = e.Store.EnrollSupervisor(v); err != nil {
-			return nil, err
-		}
 	case "reconcile":
 		c, ok := v.Child(r.Child)
 		if !ok {
 			return nil, fmt.Errorf("child is not in this plan")
+		}
+		if r.PR == 0 && !r.AckCompletion && r.Evidence == "" {
+			return nil, fmt.Errorf("provide --pr, --evidence or --ack-completion")
 		}
 		i, err := e.GitHub.Issue(ctx, p, r.Child)
 		if err != nil {
@@ -805,54 +871,47 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 		if err != nil {
 			return nil, err
 		}
+		as, _ := core.List[core.Attempt](e.Store, "attempt")
+		a := latestChild(as, p.ID, r.Child)
+		managed := a != nil && a.SupervisorID == v.ID
 		if r.PR > 0 {
-			pr, err := g.Delivery(ctx, p, r.PR)
-			if err != nil {
-				return nil, err
-			}
-			if pr.Number != r.PR || pr.MergedAt.IsZero() || pr.Base.Ref != p.Base || pr.Base.Repo.ID != p.RepoID {
-				return nil, fmt.Errorf("PR must be merged into project base")
-			}
-			as, _ := core.List[core.Attempt](e.Store, "attempt")
-			a := latestChild(as, p.ID, r.Child)
-			if a != nil && a.SupervisorID == v.ID {
+			if managed {
 				return nil, fmt.Errorf("managed child uses its recorded delivery PR")
 			}
 			ev.PR = r.PR
 			ev.External = true
 		}
+		// The delivery the reconciliation applies to: its PR and merged head.
+		prnum := ev.PR
+		if managed {
+			prnum = a.PR
+		}
+		head := ""
+		if c.Completion == "merged_and_closed" {
+			if prnum == 0 {
+				return nil, fmt.Errorf("associate a merged PR first")
+			}
+			pr, err := g.Delivery(ctx, p, prnum)
+			if err != nil {
+				return nil, err
+			}
+			if pr.Number != prnum || pr.MergedAt.IsZero() || pr.Base.Ref != p.Base || pr.Base.Repo.ID != p.RepoID {
+				return nil, fmt.Errorf("PR must be merged into project base")
+			}
+			head = pr.Head.SHA
+		}
+		if r.Evidence != "" {
+			if !core.ValidEvidenceURL(r.Evidence) {
+				return nil, fmt.Errorf("evidence must be an HTTPS URL")
+			}
+			// Bound to this delivery: a later generation needs its own evidence.
+			ev.EvidenceURL = r.Evidence
+			ev.EvidenceHead = head
+			ev.EvidenceSource = "operator"
+		}
 		if r.AckCompletion {
 			if i.State != "closed" || i.StateReason != "completed" || i.ClosedAt.IsZero() {
 				return nil, fmt.Errorf("acknowledgement requires an issue closed as completed")
-			}
-			head := ""
-			prnum := ev.PR
-			as, _ := core.List[core.Attempt](e.Store, "attempt")
-			a := latestChild(as, p.ID, r.Child)
-			if a != nil && a.SupervisorID == v.ID {
-				prnum = a.PR
-			}
-			if c.Completion == "merged_and_closed" {
-				if prnum == 0 {
-					return nil, fmt.Errorf("associate a merged PR first")
-				}
-				pr, err := g.Delivery(ctx, p, prnum)
-				if err != nil {
-					return nil, err
-				}
-				if pr.MergedAt.IsZero() || pr.Base.Ref != p.Base || pr.Base.Repo.ID != p.RepoID || i.ClosedAt.Before(pr.MergedAt) {
-					return nil, fmt.Errorf("invalid delivery evidence")
-				}
-				head = pr.Head.SHA
-			}
-			if r.Evidence != "" {
-				u, err := url.Parse(r.Evidence)
-				if err != nil || u.Scheme != "https" || u.Host == "" {
-					return nil, fmt.Errorf("evidence must be an HTTPS URL")
-				}
-			}
-			if c.RequiresEvidence && r.Evidence == "" {
-				return nil, fmt.Errorf("this child requires an evidence URL")
 			}
 			operator, err := g.Operator(ctx)
 			if err != nil {
@@ -862,14 +921,21 @@ func (e *Engine) supervisorAction(ctx context.Context, p core.Project, r Request
 			ev.AckClosedAt = i.ClosedAt
 			ev.AckUpdatedAt = i.UpdatedAt
 			ev.AckHead = head
-			ev.ApprovalCommentID = 0
-			ev.EvidenceURL = r.Evidence
-		}
-		if r.PR == 0 && !r.AckCompletion {
-			return nil, fmt.Errorf("provide --pr or --ack-completion")
 		}
 		v.Evidence[r.Child] = ev
 		_ = e.Store.Event(v.ID, "supervisor_reconciliation", fmt.Sprintf("operator reconciled child #%d", r.Child))
+		// Reconciliation is the operator's fix for an attention hold; re-check now
+		// instead of also requiring resume. Pauses and cancellations stay.
+		if v.Hold == "attention" {
+			v.Hold = ""
+			v.State = "queued"
+			v.RetryAt = time.Time{}
+			if err = e.reconcileSupervisor(ctx, p, v); err != nil {
+				return nil, err
+			}
+			e.Wake()
+			return e.Store.SupervisorFor(p.ID, r.Number)
+		}
 	default:
 		return nil, fmt.Errorf("unknown supervisor action")
 	}
@@ -933,52 +999,4 @@ func (e *Engine) enqueueIssue(ctx context.Context, p core.Project, i core.Issue,
 		return core.Attempt{}, err
 	}
 	return e.Store.EnqueueSupervised(p, i, v, retry)
-}
-
-func validEvidenceComment(c core.EvidenceComment, operator string, pr int, closed time.Time) bool {
-	if pr == 0 || c.ID == 0 || c.User.Login != operator || c.User.Type != "User" || c.CreatedAt.Before(closed) || c.CreatedAt.IsZero() || !c.UpdatedAt.Equal(c.CreatedAt) {
-		return false
-	}
-	f := strings.Fields(c.Body)
-	if len(f) != 3 || f[0] != "/approve-evidence" || f[1] != fmt.Sprintf("#%d", pr) {
-		return false
-	}
-	u, err := url.Parse(f[2])
-	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil
-}
-
-func (e *Engine) publishApprovalPrompts(ctx context.Context, p core.Project, v *core.Supervisor) error {
-	g, err := e.supervisorAdapter()
-	if err != nil {
-		return err
-	}
-	if v.ApprovalPrompts == nil {
-		v.ApprovalPrompts = map[int]core.ApprovalPrompt{}
-	}
-	for _, c := range v.Plan.Children {
-		status := childStatus(*v, c.Issue)
-		if !c.RequiresEvidence || status.PR == 0 || (status.State != "awaiting_review" && status.State != "needs_attention") {
-			continue
-		}
-		if old, ok := v.ApprovalPrompts[c.Issue]; ok && old.PR == status.PR {
-			continue
-		}
-		report := fmt.Sprintf("https://github.com/%s/pull/%d", p.Repo, status.PR)
-		if finder, ok := e.GitHub.(core.EvidenceReportFinder); ok {
-			report, err = finder.EvidenceReport(ctx, p, status.PR)
-			if err != nil {
-				return err
-			}
-		}
-		body := fmt.Sprintf("## Review and approve operational evidence\n\nReview [the validation evidence](%s) delivered in PR #%d. If you accept the results, **close this issue as completed first**, then post this exact comment here:\n\n```text\n/approve-evidence #%d %s\n```\n\nPost it as the human operator in a new comment after closure. Edited comments and approvals for older PRs or previous closures are ignored. Changathi verifies the merged delivery and advances supervisor #%d automatically; no CLI acknowledgement or resume is needed unless you explicitly paused the plan.\n", report, status.PR, status.PR, report, v.Parent.Number)
-		// Stable marker recovers a successful POST whose response was lost.
-		if _, err := g.SupervisorWorkpad(ctx, p, c.Issue, fmt.Sprintf("%s/approval/%d", v.ID, c.Issue), body); err != nil {
-			return err
-		}
-		v.ApprovalPrompts[c.Issue] = core.ApprovalPrompt{PR: status.PR, URL: report}
-		if err := e.Store.Put("supervisor", v.ID, v); err != nil {
-			return err
-		}
-	}
-	return nil
 }

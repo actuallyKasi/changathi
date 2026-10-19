@@ -108,8 +108,10 @@ type Issue struct {
 	ClosedAt    time.Time `json:"closed_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	HTMLURL     string    `json:"html_url"`
-	Labels      []Label   `json:"labels"`
-	PullRequest *struct{} `json:"pull_request,omitempty"`
+	// RepositoryURL is the API URL of the issue's repository; sub-issues may live elsewhere.
+	RepositoryURL string    `json:"repository_url,omitempty"`
+	Labels        []Label   `json:"labels"`
+	PullRequest   *struct{} `json:"pull_request,omitempty"`
 }
 type Label struct {
 	Name string `json:"name"`

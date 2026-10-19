@@ -698,6 +698,9 @@ func implementPrompt(p core.Project, a core.Attempt, flow core.Workflow) (string
 		return "", err
 	}
 	prompt := fmt.Sprintf("Work on GitHub issue #%d in %s.\nTitle: %s\nDescription:\n%s\n\n%s\n\nImplement changes and commit them on the existing branch. Do not push, create/merge PRs, close issues, or use closing keywords in commits. Changathi handles delivery after validating your changes. Leave the issue open for human review. Run the configured validation commands: %v.", a.Issue.Number, p.Repo, a.Issue.Title, a.Issue.Body, body, flow.Validation)
+	if a.Issue.HasLabel(core.EvidenceLabel) {
+		prompt += fmt.Sprintf("\n\nThis issue requires operational evidence. Commit one Markdown validation report under %s recording the commands you ran, their observed results and any checks left unrun. The supervisor will not accept the issue without it.", core.EvidenceDir)
+	}
 	if prev := a.Previous; prev != nil {
 		prompt += fmt.Sprintf("\n\nThis is rework: generation %d of this issue came before you.", prev.Generation)
 		switch {

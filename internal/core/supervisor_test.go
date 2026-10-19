@@ -34,6 +34,76 @@ func TestSupervisorParser(t *testing.T) {
 		}
 	}
 }
+func TestNativePlan(t *testing.T) {
+	issue := func(n int, labels ...string) Issue {
+		i := Issue{ID: int64(n * 100), Number: n, RepositoryURL: "https://api.github.com/repos/owner/repo"}
+		for _, l := range labels {
+			i.Labels = append(i.Labels, Label{Name: l})
+		}
+		return i
+	}
+	subs := []Issue{issue(3, EvidenceLabel), issue(4), issue(5, ManualLabel)}
+	blocked := map[int][]Issue{4: {issue(3)}, 5: {issue(4), issue(3)}}
+	p, h, err := NativePlan("owner/repo", 10, subs, blocked)
+	if err != nil || h == "" || p.Source != PlanSubIssues || len(p.Children) != 3 {
+		t.Fatal(p, err)
+	}
+	if c := p.Children[0]; !c.RequiresEvidence || c.Completion != "merged_and_closed" || len(c.DependsOn) != 0 {
+		t.Fatal(c)
+	}
+	if c := p.Children[2]; c.Completion != "closed_completed" || len(c.DependsOn) != 2 || c.DependsOn[0] != 3 {
+		t.Fatal(c)
+	}
+	// Blocker order on GitHub does not change the revision.
+	_, h2, _ := NativePlan("owner/repo", 10, subs, map[int][]Issue{4: {issue(3)}, 5: {issue(3), issue(4)}})
+	if h != h2 {
+		t.Fatal("blocker order changed revision")
+	}
+	other := issue(6)
+	other.RepositoryURL = "https://api.github.com/repos/owner/other"
+	bad := []struct {
+		subs    []Issue
+		blocked map[int][]Issue
+	}{
+		{nil, nil},
+		{subs, map[int][]Issue{4: {issue(9)}}}, // blocker outside the plan
+		{subs, map[int][]Issue{3: {issue(4)}, 4: {issue(3)}}}, // cycle
+		{append(subs, other), nil},                            // other repository
+		{append(subs, issue(7, "supervisor")), nil},           // nested supervisor
+		{append(subs, issue(10)), nil},                        // parent as child
+		{[]Issue{issue(3), issue(3)}, nil},                    // duplicate
+	}
+	for idx, tc := range bad {
+		if _, _, err := NativePlan("owner/repo", 10, tc.subs, tc.blocked); err == nil {
+			t.Fatalf("case %d accepted", idx)
+		}
+	}
+	// The fenced form is still read, and its source is part of the revision.
+	_, legacy, err := ParseSupervisor("```changathi-supervisor\nversion: 1\nchildren:\n - issue: 3\n```", 10)
+	native, _, _ := NativePlan("owner/repo", 10, []Issue{issue(3)}, nil)
+	if err != nil || SupervisorHash(native) == legacy {
+		t.Fatal("legacy and native plans share a revision")
+	}
+	if !HasPlanBlock("x\n ```changathi-supervisor \n") || HasPlanBlock("```yaml\n") {
+		t.Fatal("plan block detection")
+	}
+}
+
+func TestEvidenceLine(t *testing.T) {
+	for body, want := range map[string]string{
+		"Summary\nEvidence: https://example.test/run/1\n": "https://example.test/run/1",
+		"evidence: https://example.test/a":                "https://example.test/a",
+		"Evidence: http://example.test/a":                 "",
+		"Evidence: https://user@example.test/a":           "",
+		"See evidence at https://example.test/a":          "",
+		"":                                                "",
+	} {
+		if got := EvidenceLine(body); got != want {
+			t.Fatalf("%q: got %q", body, got)
+		}
+	}
+}
+
 func TestSupervisorAtomicOwnership(t *testing.T) {
 	s, err := OpenStore(t.TempDir())
 	if err != nil {

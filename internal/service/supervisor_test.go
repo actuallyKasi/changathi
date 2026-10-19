@@ -21,6 +21,33 @@ type supervisorGH struct {
 	writes   int
 	outage   bool
 	comments []core.EvidenceComment
+	subs     map[int][]int
+	blocked  map[int][]int
+	evidence map[int]string
+}
+
+func (g *supervisorGH) relations(ns []int) ([]core.Issue, error) {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	if g.outage {
+		return nil, fmt.Errorf("GitHub unavailable")
+	}
+	out := []core.Issue{}
+	for _, n := range ns {
+		out = append(out, g.nodes[n])
+	}
+	return out, nil
+}
+func (g *supervisorGH) SubIssues(_ context.Context, _ core.Project, n int) ([]core.Issue, error) {
+	return g.relations(g.subs[n])
+}
+func (g *supervisorGH) BlockedBy(_ context.Context, _ core.Project, n int) ([]core.Issue, error) {
+	return g.relations(g.blocked[n])
+}
+func (g *supervisorGH) EvidenceReport(_ context.Context, _ core.Project, pr int) (string, error) {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	return g.evidence[pr], nil
 }
 
 func (g *supervisorGH) Issue(_ context.Context, _ core.Project, n int) (core.Issue, error) {
@@ -123,7 +150,7 @@ func supervisorSetup(t *testing.T) (*Engine, *supervisorGH, core.Project) {
 	p.Auto = false
 	e.Config.Concurrency = 1
 	_ = e.Store.UpdateProject(p.ID, func(x *core.Project) error { x.Auto = false; return nil })
-	g := &supervisorGH{fakeGH: base, nodes: map[int]core.Issue{}, closures: map[int]core.Closure{}, external: map[int]core.DeliveryEvidence{}, pads: map[string]string{}}
+	g := &supervisorGH{fakeGH: base, nodes: map[int]core.Issue{}, closures: map[int]core.Closure{}, external: map[int]core.DeliveryEvidence{}, pads: map[string]string{}, subs: map[int][]int{}, blocked: map[int][]int{}, evidence: map[int]string{}}
 	body := "Goal\n```changathi-supervisor\nversion: 1\nchildren:\n  - issue: 3\n  - issue: 4\n    depends_on: [3]\n```"
 	g.nodes[2] = core.Issue{ID: 200, Number: 2, State: "open", Body: body, Labels: []core.Label{{Name: "supervisor"}}}
 	for _, n := range []int{3, 4, 5} {
@@ -195,36 +222,49 @@ func TestSupervisorHumanReviewAndRestart(t *testing.T) {
 		t.Fatal("owned child bypassed gate")
 	}
 }
-func TestSupervisorReloadAddsChildAndResume(t *testing.T) {
+
+// Graph edits on GitHub are adopted on the next pass, without reload or resume.
+func TestSupervisorAdoptsGraphChanges(t *testing.T) {
 	e, g, p := supervisorSetup(t)
 	ctx := context.Background()
 	actionSuper(t, e, p, "start", false)
+	body := g.nodes[2].Body
 	g.edit(2, func(i *core.Issue) {
 		i.Body = strings.TrimSuffix(i.Body, "```") + "  - issue: 5\n    depends_on: [4]\n```"
 	})
 	e.poll(ctx)
 	v, _ := e.Store.SupervisorFor(p.ID, 2)
-	if v.Hold != "attention" {
-		t.Fatal(v)
-	}
-	preview, err := e.supervisorAction(ctx, p, Request{Action: "supervisor.reload", Number: 2})
-	if err != nil || preview == nil {
-		t.Fatal(preview, err)
-	}
-	before := v.Revision
-	v = actionSuper(t, e, p, "reload", true)
-	if before == v.Revision || len(v.Plan.Children) != 3 || v.Hold != "paused" {
-		t.Fatal(v)
-	}
-	v = actionSuper(t, e, p, "resume", false)
-	if v.Hold != "" || v.Current != 3 {
+	if v.Hold != "" || len(v.Plan.Children) != 3 || v.Current != 3 {
 		t.Fatal(v)
 	}
 	as := ownedAttempts(t, e)
-	if len(as) != 1 || as[0].Generation != 1 || as[0].PlanRevision != v.Revision {
+	if len(as) != 1 || as[0].Generation != 1 {
 		t.Fatal(as)
 	}
+	// The running child was dispatched under the earlier revision and stays eligible.
+	if err := e.eligible(ctx, p, as[0]); err != nil {
+		t.Fatal(err)
+	}
+	// Removing a dispatched child holds the plan until it is restored.
+	g.edit(2, func(i *core.Issue) {
+		i.Body = strings.Replace(body, "  - issue: 3\n  - issue: 4\n    depends_on: [3]", "  - issue: 4", 1)
+	})
+	e.poll(ctx)
+	v, _ = e.Store.SupervisorFor(p.ID, 2)
+	if v.Hold != "attention" || !strings.Contains(v.Reason, "child #3 was dispatched") {
+		t.Fatal(v)
+	}
+	g.edit(2, func(i *core.Issue) { i.Body = body })
+	e.poll(ctx)
+	v, _ = e.Store.SupervisorFor(p.ID, 2)
+	if v.Hold != "" || len(v.Plan.Children) != 2 {
+		t.Fatal("restored graph did not release the hold", v)
+	}
+	if owner, _ := e.Store.SupervisorOwner(p.ID, 500); owner != "" {
+		t.Fatal("removed child is still owned")
+	}
 }
+
 func TestSupervisorClosureFailures(t *testing.T) {
 	for _, mode := range []string{"not_planned", "missing_merge", "bot", "automatic", "missing_reason", "operational"} {
 		t.Run(mode, func(t *testing.T) {
@@ -262,23 +302,28 @@ func TestSupervisorClosureFailures(t *testing.T) {
 			}
 			e.poll(ctx)
 			v, _ := e.Store.SupervisorFor(p.ID, 2)
-			want := "needs_attention"
-			if mode == "operational" {
-				// Missing evidence waits on the child without holding other branches.
-				want = "waiting_review"
-			}
-			if v.State != want || len(ownedAttempts(t, e)) != 1 {
+			if v.State != "needs_attention" || len(ownedAttempts(t, e)) != 1 {
 				t.Fatal(v)
 			}
-			if mode == "operational" || mode == "bot" || mode == "automatic" {
-				_, err := e.supervisorAction(ctx, p, Request{Action: "supervisor.reconcile", Number: 2, Child: 3, AckCompletion: true, Evidence: "https://example.test/verification"})
-				if err != nil {
-					t.Fatal(err)
+			r := Request{Action: "supervisor.reconcile", Number: 2, Child: 3}
+			switch mode {
+			case "operational":
+				if !strings.Contains(v.Reason, "no operational evidence") {
+					t.Fatal(v.Reason)
 				}
-				actionSuper(t, e, p, "resume", false)
-				if len(ownedAttempts(t, e)) != 2 {
-					t.Fatal("acknowledgement did not release next child")
-				}
+				r.Evidence = "https://example.test/verification"
+			case "bot", "automatic":
+				r.AckCompletion = true
+			default:
+				return
+			}
+			// Reconciliation releases the hold it fixes; no resume needed.
+			if _, err := e.supervisorAction(ctx, p, r); err != nil {
+				t.Fatal(err)
+			}
+			if len(ownedAttempts(t, e)) != 2 {
+				v, _ = e.Store.SupervisorFor(p.ID, 2)
+				t.Fatal("reconciliation did not release next child", v)
 			}
 		})
 	}
@@ -340,6 +385,9 @@ func TestSupervisorPauseCancelAndOutage(t *testing.T) {
 	e.poll(ctx)
 	if _, err := e.supervisorAction(ctx, p, Request{Action: "supervisor.resume", Number: 2}); err == nil {
 		t.Fatal("cancel implicitly resumed")
+	}
+	if v := actionSuper(t, e, p, "start", false); v.Hold != "" {
+		t.Fatal("start did not restart the cancelled plan", v)
 	}
 }
 func TestSupervisorAutoDiscoveryAndStableWorkpad(t *testing.T) {
@@ -488,9 +536,13 @@ func TestSupervisorLabelRemovalAndStaleAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(ownedAttempts(t, e)) != 2 {
+		t.Fatal("acknowledgement did not release next child")
+	}
 	g.edit(3, func(i *core.Issue) { i.UpdatedAt = i.UpdatedAt.Add(time.Minute) })
-	v = actionSuper(t, e, p, "resume", false)
-	if v.Hold != "attention" || len(ownedAttempts(t, e)) != 1 {
+	e.poll(ctx)
+	v, _ = e.Store.SupervisorFor(p.ID, 2)
+	if v.Hold != "attention" {
 		t.Fatal("stale acknowledgement passed", v)
 	}
 }
@@ -536,7 +588,9 @@ func (g *supervisorGH) EvidenceComments(context.Context, core.Project, int) ([]c
 	defer g.lock.Unlock()
 	return append([]core.EvidenceComment(nil), g.comments...), nil
 }
-func TestGitHubEvidenceApprovalAdvancesWithoutCLI(t *testing.T) {
+
+// Closing the issue is the only approval; evidence comes from the delivery PR.
+func TestEvidenceFromDeliveryPR(t *testing.T) {
 	e, g, p := supervisorSetup(t)
 	ctx := context.Background()
 	g.edit(2, func(i *core.Issue) {
@@ -545,96 +599,100 @@ func TestGitHubEvidenceApprovalAdvancesWithoutCLI(t *testing.T) {
 	actionSuper(t, e, p, "start", false)
 	e.dispatch(ctx)
 	e.wg.Wait()
-	g.close(3, "completed")
+	a := latestChild(ownedAttempts(t, e), p.ID, 3)
 	e.poll(ctx)
 	v, _ := e.Store.SupervisorFor(p.ID, 2)
-	if v.Hold != "" || v.State != "waiting_review" || childStatus(v, 3).Reason != evidencePending || len(ownedAttempts(t, e)) != 1 {
-		t.Fatalf("expected evidence wait: %+v", v)
+	// The missing evidence is visible before the operator closes the issue.
+	if !strings.Contains(childStatus(v, 3).Reason, fmt.Sprintf("PR #%d has no operational evidence", a.PR)) {
+		t.Fatal(childStatus(v, 3))
 	}
-	a := latestChild(ownedAttempts(t, e), p.ID, 3)
-	comment := core.EvidenceComment{ID: 10, Body: fmt.Sprintf("/approve-evidence #%d https://example.test/report", a.PR), CreatedAt: g.nodes[3].ClosedAt.Add(time.Second)}
-	comment.UpdatedAt = comment.CreatedAt
-	comment.User.Login = "operator"
-	comment.User.Type = "User"
-	g.comments = []core.EvidenceComment{comment}
+	g.lock.Lock()
+	g.evidence[a.PR] = "https://example.test/report"
+	g.lock.Unlock()
+	g.close(3, "completed")
 	e.poll(ctx)
 	v, _ = e.Store.SupervisorFor(p.ID, 2)
 	if v.Hold != "" || v.Current != 4 || len(ownedAttempts(t, e)) != 2 {
-		t.Fatalf("approval did not advance: %+v", v)
+		t.Fatalf("closure did not advance: %+v", v)
 	}
-	if v.Evidence[3].ApprovalCommentID != 10 {
-		t.Fatal("missing approval audit")
+	if ev := v.Evidence[3]; ev.EvidenceURL != "https://example.test/report" || ev.EvidenceSource != "pr" || ev.EvidenceHead != a.Head {
+		t.Fatal(ev)
 	}
-	// Deleting approval invalidates it even after it was persisted.
-	g.comments = nil
-	e.poll(ctx)
-	v, _ = e.Store.SupervisorFor(p.ID, 2)
-	if v.Hold != "attention" {
-		t.Fatal("deleted approval remained valid")
+	if !strings.Contains(g.pads[v.ID], "Evidence: https://example.test/report") {
+		t.Fatal(g.pads[v.ID])
 	}
-}
-func TestEvidenceCommentValidation(t *testing.T) {
-	closed := time.Now().UTC().Truncate(time.Second)
-	valid := core.EvidenceComment{ID: 1, Body: "/approve-evidence #13 https://example.test/report", CreatedAt: closed.Add(time.Second), UpdatedAt: closed.Add(time.Second)}
-	valid.User.Login = "operator"
-	valid.User.Type = "User"
-	if !validEvidenceComment(valid, "operator", 13, closed) {
-		t.Fatal("valid approval rejected")
-	}
-	for _, mode := range []string{"other_user", "bot", "old", "edited", "wrong_pr", "http", "extra", "reopen"} {
-		t.Run(mode, func(t *testing.T) {
-			c := valid
-			closeTime := closed
-			switch mode {
-			case "other_user":
-				c.User.Login = "someone"
-			case "bot":
-				c.User.Type = "Bot"
-			case "old":
-				c.CreatedAt = closed.Add(-time.Second)
-				c.UpdatedAt = c.CreatedAt
-			case "edited":
-				c.UpdatedAt = c.CreatedAt.Add(time.Second)
-			case "wrong_pr":
-				c.Body = "/approve-evidence #12 https://example.test/report"
-			case "http":
-				c.Body = "/approve-evidence #13 http://example.test/report"
-			case "extra":
-				c.Body += " extra"
-			case "reopen":
-				closeTime = c.CreatedAt.Add(time.Second)
-			}
-			if validEvidenceComment(c, "operator", 13, closeTime) {
-				t.Fatal("invalid approval accepted")
-			}
-		})
+	// Approval comments are no longer part of the gate.
+	if strings.Contains(g.pads[v.ID], "/approve-evidence") {
+		t.Fatal("workpad still asks for an approval comment")
 	}
 }
 
-func TestApprovalPromptContainsExactCommand(t *testing.T) {
+// Plans read from sub-issues and blocked-by links, with policies from labels.
+func TestSupervisorNativePlan(t *testing.T) {
 	e, g, p := supervisorSetup(t)
-	v := core.Supervisor{ID: "plan", Parent: core.Issue{Number: 2}, Plan: core.SupervisorPlan{Children: []core.SupervisorChild{{Issue: 3, RequiresEvidence: true}}}, Children: []core.ChildStatus{{Issue: 3, PR: 13, State: "awaiting_review"}}}
-	if err := e.publishApprovalPrompts(context.Background(), p, &v); err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+	g.edit(2, func(i *core.Issue) { i.Body = "Goal only; the graph is on GitHub." })
+	if _, err := e.supervisorAction(ctx, p, Request{Action: "supervisor.validate", Number: 2}); err == nil {
+		t.Fatal("parent without sub-issues validated")
 	}
-	body := g.pads["plan/approval/3"]
-	command := fmt.Sprintf("/approve-evidence #13 https://github.com/%s/pull/13", p.Repo)
-	if !strings.Contains(body, command) || !strings.Contains(body, "close this issue as completed first") {
-		t.Fatal(body)
+	g.edit(3, func(i *core.Issue) { i.Labels = []core.Label{{Name: core.EvidenceLabel}} })
+	g.edit(5, func(i *core.Issue) { i.Labels = []core.Label{{Name: core.ManualLabel}} })
+	g.subs[2] = []int{3, 4, 5}
+	g.blocked[4] = []int{3}
+	v := actionSuper(t, e, p, "start", false)
+	c3, _ := v.Child(3)
+	c4, _ := v.Child(4)
+	c5, _ := v.Child(5)
+	if v.Plan.Source != core.PlanSubIssues || !c3.RequiresEvidence || len(c4.DependsOn) != 1 || c5.Completion != "closed_completed" {
+		t.Fatal(v.Plan)
 	}
-	writes := g.writes
-	if err := e.publishApprovalPrompts(context.Background(), p, &v); err != nil {
-		t.Fatal(err)
+	as := ownedAttempts(t, e)
+	if len(as) != 1 || as[0].Issue.Number != 3 {
+		t.Fatal("manual gate or blocked child dispatched", as)
 	}
-	if g.writes != writes {
-		t.Fatal("unchanged prompt republished")
+	prompt, err := implementPrompt(p, as[0], core.Workflow{})
+	if err != nil || !strings.Contains(prompt, core.EvidenceDir) {
+		t.Fatal("evidence child prompt lacks the report instruction", err)
 	}
-	v.Children[0].PR = 14
-	if err := e.publishApprovalPrompts(context.Background(), p, &v); err != nil {
-		t.Fatal(err)
+	hold := func(want string) {
+		t.Helper()
+		e.poll(ctx)
+		v, _ = e.Store.SupervisorFor(p.ID, 2)
+		if want == "" && v.Hold != "" || want != "" && (v.Hold != "attention" || !strings.Contains(v.Reason, want)) {
+			t.Fatal(want, v.Hold, v.Reason)
+		}
 	}
-	if !strings.Contains(g.pads["plan/approval/3"], "/approve-evidence #14 ") {
-		t.Fatal("stale PR prompt")
+	// A blocker outside the plan, a removed dispatched child and a new blocker on
+	// in-flight work each hold the plan until undone on GitHub.
+	g.nodes[9] = core.Issue{ID: 900, Number: 9, State: "open"}
+	g.blocked[4] = []int{3, 9}
+	hold("not a sub-issue of #2")
+	g.blocked[4] = []int{3}
+	hold("")
+	g.subs[2] = []int{4, 5}
+	hold("#4 is blocked by #3, which is not a sub-issue")
+	delete(g.blocked, 4)
+	hold("child #3 was dispatched")
+	g.subs[2] = []int{3, 4, 5}
+	g.blocked[4] = []int{3}
+	hold("")
+	g.blocked[3] = []int{5}
+	hold("cannot add blocker #5 to dispatched child #3")
+	delete(g.blocked, 3)
+	hold("")
+	// Removing a blocker from an undispatched child takes effect at once.
+	delete(g.blocked, 4)
+	hold("")
+	if a := latestChild(ownedAttempts(t, e), p.ID, 4); a == nil {
+		t.Fatal("unblocked child did not start")
+	}
+	// An API outage while reading the graph is a remote wait, not a plan hold.
+	g.outage = true
+	e.poll(ctx)
+	g.outage = false
+	v, _ = e.Store.SupervisorFor(p.ID, 2)
+	if v.Hold != "" || v.State != "waiting_remote" {
+		t.Fatal(v)
 	}
 }
 

@@ -57,9 +57,9 @@ func (a *app) supervisor() *cobra.Command {
 	}}
 	list.Flags().StringVar(&project, "project", "", "Filter by registered project")
 	cmd.AddCommand(list)
-	for _, action := range []string{"validate", "start", "show", "pause", "resume", "cancel", "reload", "reconcile"} {
+	for _, action := range []string{"validate", "start", "show", "pause", "resume", "cancel", "reconcile"} {
 		action := action
-		var apply, ack bool
+		var ack bool
 		var child, pr int
 		var evidence string
 		c := &cobra.Command{Use: action + " <project>#<parent>", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, args []string) error {
@@ -67,17 +67,14 @@ func (a *app) supervisor() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return a.action(c.Context(), service.Request{Action: "supervisor." + action, Project: p, Number: n, Apply: apply, Child: child, PR: pr, AckCompletion: ack, Evidence: evidence})
+			return a.action(c.Context(), service.Request{Action: "supervisor." + action, Project: p, Number: n, Child: child, PR: pr, AckCompletion: ack, Evidence: evidence})
 		}}
-		if action == "reload" {
-			c.Flags().BoolVar(&apply, "apply", false, "Adopt the displayed plan revision; remains paused until resume")
-		}
 		if action == "reconcile" {
 			c.Flags().IntVar(&child, "child", 0, "Child issue number")
 			_ = c.MarkFlagRequired("child")
 			c.Flags().IntVar(&pr, "pr", 0, "Associate a previously merged external PR")
-			c.Flags().BoolVar(&ack, "ack-completion", false, "Attest that the closed child's acceptance criteria are complete")
-			c.Flags().StringVar(&evidence, "evidence", "", "HTTPS URL documenting operational verification")
+			c.Flags().BoolVar(&ack, "ack-completion", false, "Attest a closure GitHub cannot attribute to you (bot or automatic)")
+			c.Flags().StringVar(&evidence, "evidence", "", "HTTPS URL of operational evidence the delivery PR lacks")
 		}
 		cmd.AddCommand(c)
 	}
