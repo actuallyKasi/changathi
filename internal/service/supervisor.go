@@ -163,6 +163,13 @@ func (e *Engine) adoptPlan(ctx context.Context, p core.Project, v *core.Supervis
 	return nil
 }
 
+// closureMatches ties a closed event to the issue's closed_at. GitHub records
+// the two separately and they can differ by a second or so.
+func closureMatches(event, closedAt time.Time) bool {
+	d := event.Sub(closedAt)
+	return !event.IsZero() && d >= -5*time.Second && d <= 5*time.Second
+}
+
 func latestChild(as []core.Attempt, p string, n int) *core.Attempt {
 	var latest *core.Attempt
 	for _, a := range as {
@@ -262,7 +269,7 @@ func (e *Engine) completed(ctx context.Context, p core.Project, v core.Superviso
 		if err != nil {
 			return false, prnum, "", err
 		}
-		if closure.Event != "closed" || !closure.CreatedAt.Equal(i.ClosedAt) || closure.Actor.Login != operator || closure.Actor.Type != "User" || closure.CommitID != "" || closure.App != nil {
+		if closure.Event != "closed" || !closureMatches(closure.CreatedAt, i.ClosedAt) || closure.Actor.Login != operator || closure.Actor.Type != "User" || closure.CommitID != "" || closure.App != nil {
 			return false, prnum, "human completion is ambiguous; acknowledge completion explicitly", nil
 		}
 	}
@@ -400,7 +407,7 @@ func (e *Engine) inspectSupervisor(ctx context.Context, p core.Project, v *core.
 			if err != nil {
 				return nil, err
 			}
-			if cl.Event == "closed" && cl.Actor.Login == operator && cl.Actor.Type == "User" && cl.CommitID == "" && cl.App == nil && cl.CreatedAt.Equal(parent.ClosedAt) {
+			if cl.Event == "closed" && cl.Actor.Login == operator && cl.Actor.Type == "User" && cl.CommitID == "" && cl.App == nil && closureMatches(cl.CreatedAt, parent.ClosedAt) {
 				v.State = "done"
 				v.Current = 0
 				v.Reason = "all children and parent reviewed"

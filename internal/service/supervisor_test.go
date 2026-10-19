@@ -782,3 +782,21 @@ func TestSupervisorReworkOfDeliveredChild(t *testing.T) {
 		t.Fatal("dependant did not start after the reworked child closed", v.Reason)
 	}
 }
+
+func TestClosureMatchesToleratesGitHubSkew(t *testing.T) {
+	closed := time.Date(2026, 10, 8, 10, 34, 51, 0, time.UTC)
+	for _, c := range []struct {
+		event time.Time
+		want  bool
+	}{
+		{closed, true},
+		{closed.Add(time.Second), true},
+		{closed.Add(-time.Second), true},
+		{closed.Add(10 * time.Second), false},
+		{time.Time{}, false},
+	} {
+		if got := closureMatches(c.event, closed); got != c.want {
+			t.Errorf("closureMatches(%v) = %v, want %v", c.event, got, c.want)
+		}
+	}
+}
